@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: ghcr.io/ledgerhq/ledger-app-builder/ledger-app-dev-tools:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Python packages
+        run: |
+          python3 -m venv --system-site-packages /tmp/venv
+          /tmp/venv/bin/pip install -r tests/requirements.txt
+      - name: Release build
+        run: make BOLOS_SDK=$NANOSP_SDK
+      - name: The release build has no test command
+        run: /tmp/venv/bin/python tests/run.py --release
+      - name: Test build
+        run: make BOLOS_SDK=$NANOSP_SDK clean && make BOLOS_SDK=$NANOSP_SDK TEST_BUILD=1
+      - name: Test sets
+        run: sh tests/fetch.sh
+      - name: Tests in the emulator
+        run: /tmp/venv/bin/python tests/run.py

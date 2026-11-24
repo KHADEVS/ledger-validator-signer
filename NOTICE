@@ -1,0 +1,13 @@
+ledger-validator-signer
+Copyright 2026 Khadim
+
+This product includes software from app-btec, commit 6de11d31a60a554905412d35f92c0f2c911ee8ae
+https://github.com/LedgerHQ/app-btec
+(c) Ledger SAS, licensed under the Apache License, Version 2.0.
+
+Files taken from app-btec:
+  src/app_main.c, src/globals.h, src/constants.h, src/apdu/dispatcher.h,
+  src/handler/bls_common.*, src/handler/get_version.*, src/handler/get_app_name.*, icons/, glyphs/
+Files taken from app-btec and modified:
+  Makefile, src/apdu/dispatcher.c, src/handler/get_pk.*, src/ui/menu_bagl.c, src/ui/menu.h,
+  src/types.h, src/sw.h

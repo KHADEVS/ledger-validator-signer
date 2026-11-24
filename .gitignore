@@ -1,0 +1,8 @@
+build/
+bin/
+debug/
+dep/
+obj/
+src/glyphs.*
+tests/data/
+__pycache__/
