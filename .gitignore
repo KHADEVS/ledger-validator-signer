@@ -6,3 +6,4 @@ obj/
 src/glyphs.*
 tests/data/
 __pycache__/
+daemon/target/

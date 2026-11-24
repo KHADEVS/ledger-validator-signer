@@ -7,9 +7,11 @@ With --release, checks instead that a release build has no test command.
 - exits (a press each time) and builder registrations (only for the approved fee recipient);
 - EIP-3076 interchange tests, minimal strategy: every accept and refuse must match;
 - 2-of-3 threshold: two partial signatures give the group's signature;
-- restart: the slashing record survives a power cycle.
+- restart: the slashing record survives a power cycle;
+- the daemon: the same API examples over HTTP, with the device behind it.
 
-Environment: APP (the .elf), SPECULOS (the command), DATA (see fetch.sh), WORK (a scratch folder).
+Environment: APP (the .elf), SPECULOS (the command), DATA (see fetch.sh), WORK (a scratch folder),
+DAEMON (the daemon's binary; without it, the daemon is not tested).
 """
 import glob
 import hashlib
@@ -24,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import yaml
@@ -565,6 +568,105 @@ def test_restart():
     emu.stop()
 
 
+def http(method, url, body=None, accept=None):
+    headers = {"Content-Type": "application/json"}
+    if accept:
+        headers["Accept"] = accept
+    data = body if isinstance(body, bytes) else json.dumps(body).encode() if body is not None else None
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method=method, data=data, headers=headers), timeout=120) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def test_daemon():
+    """The API examples again, as HTTP requests to the daemon, which holds the device."""
+    exe = os.environ.get("DAEMON")
+    if not exe:
+        print("skip the daemon: DAEMON is not set")
+        return
+    doc = yaml.safe_load(open(f"{DATA}/remote-signing-api/signing/paths/sign.yaml"))
+    examples = doc["post"]["requestBody"]["content"]["application/json"]["examples"]
+    roots = {e["value"]["fork_info"]["genesis_validators_root"] for e in examples.values() if "fork_info" in e["value"]}
+    assert len(roots) == 1, roots
+    root = unhex(roots.pop())
+    r = examples["VALIDATOR_REGISTRATION"]["value"]["validator_registration"]
+    fee, gas, stamp = unhex(r["fee_recipient"]), int(r["gas_limit"]), int(r["timestamp"])
+    published = unhex(examples["VALIDATOR_REGISTRATION"]["value"]["signingRoot"])
+    genesis = next(x for x in (bytes(4), b"\0\0\0\1") if registration_root(fee, gas, stamp, unhex(r["pubkey"]), x) == published)
+
+    emu = Emulator()
+    assert emu.enable(root)[0] == 0x9000
+    emu.write(SET_FEE, fee + le(gas))
+    emu.choose("Approve")
+    assert emu.answer()[1] == 0x9000
+    emu.sock.close()  # the daemon takes the device from here
+
+    url = "http://127.0.0.1:9100"
+    log = open(f"{WORK}/daemon.log", "w")
+    daemon = subprocess.Popen([exe, "--device", "127.0.0.1:9999", "--listen", "127.0.0.1:9100", "--keys", "32",
+                               "--genesis-fork-version", "0x" + genesis.hex(),
+                               "--genesis-validators-root", "0x" + root.hex()], stdout=log, stderr=log)
+    try:
+        for _ in range(200):
+            time.sleep(0.25)
+            if daemon.poll() is not None:
+                raise SystemExit(f"the daemon stopped, see {WORK}/daemon.log")
+            try:
+                if http("GET", url + "/upcheck")[0] == 200:
+                    break
+            except OSError:
+                continue
+        else:
+            raise SystemExit("the daemon did not start")
+        keys = json.loads(http("GET", url + "/api/v1/eth2/publicKeys")[1])
+        check("daemon: lists the device's keys", len(keys) == 32 and len(set(keys)) == 32)
+        signed, used = 0, {}
+        for n, (name, example) in enumerate(examples.items()):
+            v = dict(example["value"])
+            key = used[name] = keys[n]
+            pk, expected = unhex(key), unhex(v["signingRoot"]) if "signingRoot" in v else None
+            header_only = v["type"] not in ("BLOCK", "BLOCK_V2") or "block_header" in v.get("beacon_block", {})
+            signable = "fork_info" in v and expected is not None and header_only
+            if v["type"] == "VALIDATOR_REGISTRATION":
+                v["validator_registration"] = dict(r, pubkey=key)
+                expected, signable = registration_root(fee, gas, stamp, pk, genesis), True
+            if v["type"] == "AGGREGATE_AND_PROOF_V2" and "(GLOAS)" in name:
+                expected = unhex(examples["AGGREGATE_AND_PROOF_V2 (FULU)"]["value"]["signingRoot"])  # see above
+            target = f"{url}/api/v1/eth2/sign/{key}"
+            if v["type"] == "VOLUNTARY_EXIT":
+                answer = []
+                thread = threading.Thread(target=lambda: answer.append(http("POST", target, v, "application/json")))
+                thread.start()
+                time.sleep(0.5)
+                emu.choose("Approve")
+                thread.join(120)
+                status, body = answer[0]
+            else:
+                status, body = http("POST", target, v, "application/json")
+            if not signable:
+                check(f"daemon: {name} is refused as a bad request", status == 400, f"{status} {body[:70]}")
+                continue
+            ok = status == 200 and bls.Verify(pk, expected, unhex(json.loads(body)["signature"]))
+            check(f"daemon: {name}", ok, "" if ok else f"{status} {body[:80]}")
+            signed += ok
+        check("daemon: examples signed", signed >= 23, f"{signed} examples")
+        again = examples["ATTESTATION"]["value"]
+        status, body = http("POST", f"{url}/api/v1/eth2/sign/{used['ATTESTATION']}", again)
+        check("daemon: the same attestation again is 412", status == 412, f"{status} {body[:60]}")
+        status, body = http("POST", f"{url}/api/v1/eth2/sign/{used['RANDAO_REVEAL']}", examples["RANDAO_REVEAL"]["value"])
+        check("daemon: plain text when JSON is not asked for", status == 200 and body.startswith("0x") and len(body) == 194)
+        check("daemon: an unknown key is 404", http("POST", f"{url}/api/v1/eth2/sign/0x{'ab' * 48}", again)[0] == 404)
+        check("daemon: a body that is not JSON is 400", http("POST", f"{url}/api/v1/eth2/sign/{keys[0]}", b"{")[0] == 400)
+        other = dict(again, fork_info=dict(again["fork_info"], genesis_validators_root="0x" + "11" * 32))
+        check("daemon: another network is not signed", http("POST", f"{url}/api/v1/eth2/sign/{keys[31]}", other)[0] == 500)
+    finally:
+        daemon.terminate()
+        daemon.wait(20)
+        emu.stop()
+
+
 def test_release():
     """A release build has none of the test commands."""
     emu = Emulator()
@@ -591,6 +693,7 @@ def main():
     emu.stop()
     test_restart()
     test_before_approval()
+    test_daemon()
     print(f"\n{'FAILED: ' + ', '.join(FAILED) if FAILED else 'ALL PASSED'}")
     return bool(FAILED)
 

@@ -9,13 +9,37 @@ permissions:
   contents: read
 
 jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format and lints
+        run: |
+          cargo fmt --manifest-path daemon/Cargo.toml --check
+          cargo clippy --manifest-path daemon/Cargo.toml --locked -- -D warnings
+      # A static binary, so that it runs in the emulator's container whatever its C library.
+      - name: Build
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --manifest-path daemon/Cargo.toml --locked --release --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon
+          path: daemon/target/x86_64-unknown-linux-musl/release/validator-signer-daemon
+
   test:
+    needs: daemon
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container: ghcr.io/ledgerhq/ledger-app-builder/ledger-app-dev-tools:latest
     steps:
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon
+          path: daemon-bin
       - name: Python packages
         run: |
           python3 -m venv --system-site-packages /tmp/venv
@@ -28,5 +52,7 @@ jobs:
         run: make BOLOS_SDK=$NANOSP_SDK clean && make BOLOS_SDK=$NANOSP_SDK TEST_BUILD=1
       - name: Test sets
         run: sh tests/fetch.sh
-      - name: Tests in the emulator
-        run: /tmp/venv/bin/python tests/run.py
+      - name: Tests in the emulator, the daemon included
+        run: |
+          chmod +x daemon-bin/validator-signer-daemon
+          DAEMON=$PWD/daemon-bin/validator-signer-daemon /tmp/venv/bin/python tests/run.py
