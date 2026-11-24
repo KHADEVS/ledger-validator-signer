@@ -46,7 +46,8 @@ SLASHABLE, NOT_ENABLED, BAD_KEY, BAD_DUTY, SETTING = 0xB101, 0xB102, 0xB103, 0xB
 PUBKEY, ENABLE, ATTEST, BLOCK, MARK, IMPORT, RESET, SHARE = 0x06, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26
 AGGREGATION_SLOT, RANDAO, SYNC_MESSAGE, SYNC_SELECTION = 0x27, 0x28, 0x29, 0x2A
 BEGIN, BITS, END, EXIT, SET_FEE, REGISTRATION = 0x2C, 0x2D, 0x2E, 0x30, 0x31, 0x32
-AGGREGATE, AGGREGATE_ELECTRA, CONTRIBUTION = b"\0", b"\1", b"\2"
+CONTRIBUTION = b"\2"
+BEFORE_ELECTRA, ELECTRA, GLOAS = 0, 1, 3  # how an aggregate is laid out and hashed
 MAINNET = bytes.fromhex("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95")
 HOODI = bytes.fromhex("212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f")
 SEPOLIA = bytes.fromhex("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078")
@@ -231,12 +232,20 @@ def merkle(chunks, leaves):
     return layer[0] if layer else zero
 
 
+def progressive(chunks, leaves=1):
+    """EIP-7916: a chain of subtrees of 1, 4, 16... chunks."""
+    if not chunks:
+        return bytes(32)
+    return sha(merkle(chunks[:leaves], leaves), progressive(chunks[leaves:], leaves * 4))
+
+
 def bitlist_root(serialized, limit):
+    """`limit` in bits, or None for the progressive bit list of Gloas."""
     top = serialized[-1].bit_length() - 1
     length = 8 * (len(serialized) - 1) + top
     data = (serialized[:-1] + bytes([serialized[-1] & ~(1 << top)]))[:(length + 7) // 8]
     chunks = [pad(data[i:i + 32]) for i in range(0, len(data), 32)]
-    return sha(merkle(chunks, limit // 256), length.to_bytes(32, "little"))
+    return sha(merkle(chunks, limit // 256) if limit else progressive(chunks), length.to_bytes(32, "little"))
 
 
 def signature_root(sig):
@@ -253,11 +262,14 @@ def domain(kind, version, root):
     return kind + sha(pad(version), root)[:28]
 
 
-def aggregate_root(electra, index, body, bits, committee_bits, sig, proof, version, root):
-    fields = [bitlist_root(bits, 131072 if electra else 2048), data_root(body), signature_root(sig)]
-    if electra:
+def aggregate_root(kind, index, body, bits, committee_bits, sig, proof, version, root):
+    limit = {BEFORE_ELECTRA: 2048, ELECTRA: 131072, GLOAS: None}[kind]
+    fields = [bitlist_root(bits, limit), data_root(body), signature_root(sig)]
+    if kind != BEFORE_ELECTRA:
         fields.append(pad(committee_bits))
-    message = merkle([pad(le(index)), merkle(fields, 4), signature_root(proof)], 4)
+    # Since Gloas the attestation is a progressive container (EIP-7495), with its four fields active.
+    aggregate = sha(progressive(fields), pad(b"\x0f")) if kind == GLOAS else merkle(fields, 4)
+    message = merkle([pad(le(index)), aggregate, signature_root(proof)], 4)
     return sha(message, domain(b"\6\0\0\0", version, root))
 
 
@@ -268,9 +280,9 @@ def registration_root(fee, gas, timestamp, pubkey, genesis_version):
 
 # --- the duties ------------------------------------------------------------------------------------
 
-def send_aggregate(emu, key, version, root, electra, index, body, bits, committee_bits, sig, proof):
-    start = header(key, version, root) + (AGGREGATE_ELECTRA if electra else AGGREGATE)
-    start += le(index) + body + struct.pack(">I", len(bits)) + (committee_bits if electra else bytes(8))
+def send_aggregate(emu, key, version, root, kind, index, body, bits, committee_bits, sig, proof):
+    start = header(key, version, root) + bytes([kind])
+    start += le(index) + body + struct.pack(">I", len(bits)) + (committee_bits if kind else bytes(8))
     sw = emu.send(BEGIN, start)[1]
     for i in range(0, len(bits), 255):
         if sw == 0x9000:
@@ -337,22 +349,17 @@ def test_api_examples(emu):
             sig, sw = emu.send(END, unhex(c["signature"]) + unhex(m["selection_proof"]))
         elif kind in ("AGGREGATE_AND_PROOF", "AGGREGATE_AND_PROOF_V2"):
             m = v["aggregate_and_proof"]
-            electra = m.get("version") in ("ELECTRA", "FULU", "GLOAS")
+            layout = {"ELECTRA": ELECTRA, "FULU": ELECTRA, "GLOAS": GLOAS}.get(m.get("version"), BEFORE_ELECTRA)
             m = m.get("data", m)
             g, a = m["aggregate"], m["aggregate"]["data"]
             body = attestation(a["slot"], a["index"], unhex(a["beacon_block_root"]),
                                a["source"]["epoch"], unhex(a["source"]["root"]),
                                a["target"]["epoch"], unhex(a["target"]["root"]))
             version = version_of(fork, int(a["slot"]) // 32)
-            parts = (electra, int(m["aggregator_index"]), body, unhex(g["aggregation_bits"]),
+            parts = (layout, int(m["aggregator_index"]), body, unhex(g["aggregation_bits"]),
                      unhex(g.get("committee_bits", "0x")), unhex(g["signature"]), unhex(m["selection_proof"]))
-            here = aggregate_root(*parts, version, root)
-            if "(GLOAS)" in name and here != expected:
-                # Same content as the Fulu example, another published root: the example is wrong upstream.
-                fulu = unhex(examples["AGGREGATE_AND_PROOF_V2 (FULU)"]["value"]["signingRoot"])
-                print(f"note {name}: the published root does not match the content, the Fulu one is used")
-                expected = fulu
-            check(f"the root computed here for {name} is the published one", here == expected)
+            check(f"the root computed here for {name} is the published one",
+                  aggregate_root(*parts, version, root) == expected)
             sig, sw = send_aggregate(emu, key, version, root, *parts)
         elif kind == "VOLUNTARY_EXIT":
             m = v["voluntary_exit"]
@@ -382,22 +389,25 @@ def test_aggregates(emu):
     key, pk = 30, emu.pubkey(30)
     body = attestation(1000, 3, b"\5" * 32, 30, b"\6" * 32, 31, b"\7" * 32)
     sig, proof = secrets.token_bytes(96), secrets.token_bytes(96)
-    for electra, sizes in ((False, (0, 1, 7, 8, 9, 255, 256, 257, 511, 2040, 2047, 2048)),
-                           (True, (0, 1, 256, 2048, 2049, 65535, 65536, 65537, 131071, 131072))):
+    # For Gloas, the sizes sit around the ends of the subtrees: 1, 5, 21, 85 and 341 chunks of 256 bits.
+    for kind, name, sizes in (
+            (BEFORE_ELECTRA, "before Electra", (0, 1, 7, 8, 9, 255, 256, 257, 511, 2040, 2047, 2048)),
+            (ELECTRA, "since Electra", (0, 1, 256, 2048, 2049, 65535, 65536, 65537, 131071, 131072)),
+            (GLOAS, "since Gloas", (0, 1, 255, 256, 257, 1279, 1280, 1281, 5376, 5377, 21760, 21761, 87296, 87297,
+                                    131071, 131072))):
         wrong = []
         for bits in sizes:
             value = secrets.randbits(bits) | (1 << bits)  # the bit that ends the list
             serialized = value.to_bytes(bits // 8 + 1, "little")
             committee = secrets.token_bytes(8)
-            parts = (electra, 77, body, serialized, committee, sig, proof)
+            parts = (kind, 77, body, serialized, committee, sig, proof)
             out, sw = send_aggregate(emu, key, version, root, *parts)
             if sw != 0x9000 or not bls.Verify(pk, aggregate_root(*parts, version, root), out):
                 wrong.append(bits)
-        check(f"aggregates {'since Electra' if electra else 'before Electra'}, {len(sizes)} sizes of bit list",
-              not wrong, f"wrong for {wrong} bits" if wrong else "")
+        check(f"aggregates {name}, {len(sizes)} sizes of bit list", not wrong, f"wrong for {wrong} bits" if wrong else "")
 
     def start(electra, length):
-        data = header(key, version, root) + (AGGREGATE_ELECTRA if electra else AGGREGATE)
+        data = header(key, version, root) + bytes([ELECTRA if electra else BEFORE_ELECTRA])
         return emu.send(BEGIN, data + le(77) + body + struct.pack(">I", length) + bytes(8))[1]
 
     check("bits without a start are refused", emu.send(BITS, b"\1")[1] == BAD_DUTY)
@@ -460,7 +470,7 @@ def test_before_approval():
     head = header(0, b"\0\0\0\1", root)
     for name, ins, body in (("aggregation slot", AGGREGATION_SLOT, le(1)), ("RANDAO", RANDAO, le(1)),
                             ("sync message", SYNC_MESSAGE, bytes(32)), ("sync selection", SYNC_SELECTION, bytes(16)),
-                            ("exit", EXIT, bytes(16)), ("aggregate", BEGIN, AGGREGATE + bytes(148)),
+                            ("exit", EXIT, bytes(16)), ("aggregate", BEGIN, bytes([GLOAS]) + bytes(148)),
                             ("contribution", BEGIN, CONTRIBUTION + bytes(72))):
         check(f"{name}: refused before a network is enabled", emu.send(ins, head + body)[1] == NOT_ENABLED)
     assert emu.enable(root)[0] == 0x9000
@@ -632,8 +642,6 @@ def test_daemon():
             if v["type"] == "VALIDATOR_REGISTRATION":
                 v["validator_registration"] = dict(r, pubkey=key)
                 expected, signable = registration_root(fee, gas, stamp, pk, genesis), True
-            if v["type"] == "AGGREGATE_AND_PROOF_V2" and "(GLOAS)" in name:
-                expected = unhex(examples["AGGREGATE_AND_PROOF_V2 (FULU)"]["value"]["signingRoot"])  # see above
             target = f"{url}/api/v1/eth2/sign/{key}"
             if v["type"] == "VOLUNTARY_EXIT":
                 answer = []

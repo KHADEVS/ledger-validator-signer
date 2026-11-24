@@ -193,10 +193,12 @@ fn sign(
         }
         "AGGREGATE_AND_PROOF" | "AGGREGATE_AND_PROOF_V2" => {
             let outer = &r["aggregate_and_proof"];
-            let electra = matches!(
-                outer["version"].as_str(),
-                Some("ELECTRA" | "FULU" | "GLOAS")
-            );
+            // The layout of an attestation changed in Electra, and its hashing in Gloas.
+            let kind = match outer["version"].as_str() {
+                Some("GLOAS") => 3u8,
+                Some("ELECTRA" | "FULU") => 1,
+                _ => 0,
+            };
             let m = if outer["data"].is_null() {
                 outer
             } else {
@@ -205,11 +207,11 @@ fn sign(
             let aggregate = &m["aggregate"];
             let bits = bytes(&aggregate["aggregation_bits"], "aggregation_bits")?;
             let mut start = header(key, r, number(&aggregate["data"]["slot"], "slot")? / 32)?;
-            start.push(u8::from(electra));
+            start.push(kind);
             start.extend(le(&m["aggregator_index"], "aggregator_index")?);
             start.extend(attestation_data(&aggregate["data"])?);
             start.extend((bits.len() as u32).to_be_bytes());
-            if electra {
+            if kind != 0 {
                 start.extend(sized::<8>(&aggregate["committee_bits"], "committee_bits")?);
             } else {
                 start.extend([0u8; 8]);

@@ -72,7 +72,9 @@ typedef struct {
     uint32_t chunks;
     uint64_t bit_length;
     uint8_t chunk[32];
-    uint8_t stack[10][32];
+    uint8_t stack[11][32];
+    uint8_t sub;         /* Gloas: the subtree being filled */
+    uint8_t subs[6][32]; /* Gloas: roots of the subtrees of 1, 4, 16, 64, 256 and 1024 chunks */
 } stream_t;
 
 static stream_t g_stream;
@@ -418,6 +420,19 @@ static void merkle_finish(uint8_t depth, uint8_t out[32]) {
     memcpy(out, acc, 32);
 }
 
+/*
+ * One more chunk of the bit list. Since Gloas (EIP-7688) the list is hashed as a chain of
+ * subtrees of 1, 4, 16... chunks, so that its root does not depend on a maximum size.
+ */
+static void stream_chunk(const uint8_t chunk[32]) {
+    merkle_push(chunk);
+    if (g_stream.kind == STREAM_AGGREGATE_GLOAS && g_stream.chunks == (1u << (2 * g_stream.sub))) {
+        merkle_finish(2 * g_stream.sub, g_stream.subs[g_stream.sub]);
+        g_stream.sub++;
+        g_stream.chunks = 0;
+    }
+}
+
 static int stream_fail(int sw) {
     g_stream.active = 0;
     return io_send_sw(sw);
@@ -449,7 +464,8 @@ int handler_stream_begin(const uint8_t *d, size_t len) {
         memcpy(g_stream.inner[1], p + 16, 32);
         leaf_u64(g_stream.inner[2], p + 48);
         memcpy(g_stream.inner[3], p + 56, 16);
-    } else if (kind == STREAM_AGGREGATE || kind == STREAM_AGGREGATE_ELECTRA) {
+    } else if (kind == STREAM_AGGREGATE || kind == STREAM_AGGREGATE_ELECTRA ||
+               kind == STREAM_AGGREGATE_GLOAS) {
         if (len != DUTY_HEADER + 1 + 148) {
             return io_send_sw(SW_WRONG_DATA_LENGTH);
         }
@@ -459,7 +475,7 @@ int handler_stream_begin(const uint8_t *d, size_t len) {
         if (g_stream.bits_len == 0 || g_stream.bits_len > limit / 8 + 1) {
             return io_send_sw(SW_BAD_DUTY);
         }
-        if (kind == STREAM_AGGREGATE_ELECTRA) {
+        if (kind != STREAM_AGGREGATE) {
             memcpy(g_stream.inner[3], p + 140, 8);
         }
     } else {
@@ -501,7 +517,7 @@ int handler_stream_bits(const uint8_t *d, size_t len) {
         }
         g_stream.chunk[g_stream.fill++] = byte;
         if (g_stream.fill == 32) {
-            merkle_push(g_stream.chunk);
+            stream_chunk(g_stream.chunk);
             memset(g_stream.chunk, 0, 32);
             g_stream.fill = 0;
         }
@@ -532,18 +548,43 @@ int handler_stream_end(const uint8_t *d) {
             return io_send_sw(SW_BAD_DUTY);
         }
         if (g_stream.fill != 0) {
-            merkle_push(g_stream.chunk);
+            stream_chunk(g_stream.chunk);
         }
-        merkle_finish(g_stream.kind == STREAM_AGGREGATE ? 3 : 9, a);
+        if (g_stream.kind == STREAM_AGGREGATE_GLOAS) {
+            uint8_t count = g_stream.sub;
+            if (g_stream.chunks != 0) {
+                merkle_finish(2 * g_stream.sub, g_stream.subs[g_stream.sub]);
+                count++;
+            }
+            memset(a, 0, 32);
+            while (count > 0) {
+                count--;
+                hash2(g_stream.subs[count], a, a);
+            }
+        } else {
+            merkle_finish(g_stream.kind == STREAM_AGGREGATE ? 3 : 9, a);
+        }
         memset(b, 0, 32);
         for (int i = 0; i < 8; i++) {
             b[i] = (uint8_t) (g_stream.bit_length >> (8 * i));
         }
         hash2(a, b, g_stream.inner[0]); /* the length is mixed in */
         bytes96_root(d, g_stream.inner[2]);
-        hash2(g_stream.inner[0], g_stream.inner[1], a);
-        hash2(g_stream.inner[2], g_stream.inner[3], b);
-        hash2(a, b, inner);
+        if (g_stream.kind == STREAM_AGGREGATE_GLOAS) {
+            /* A progressive container of four fields: the first alone, then the next three. */
+            hash2(g_stream.inner[1], g_stream.inner[2], a);
+            hash2(g_stream.inner[3], zero, b);
+            hash2(a, b, a);
+            hash2(a, zero, a);
+            hash2(g_stream.inner[0], a, a);
+            memset(b, 0, 32);
+            b[0] = 0x0f; /* its four fields are active */
+            hash2(a, b, inner);
+        } else {
+            hash2(g_stream.inner[0], g_stream.inner[1], a);
+            hash2(g_stream.inner[2], g_stream.inner[3], b);
+            hash2(a, b, inner);
+        }
         domain = 0x06;
     }
     hash2(g_stream.index_leaf, inner, a);

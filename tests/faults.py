@@ -37,6 +37,7 @@ FAULTS = [
      "    int sw = 0;\n    key = U4BE(g_stream.header, 0);\n    (void) sw;\n    if (g_stream.kind == STREAM_CONTRIBUTION) {"),
     ("tree of the bit list one level short", "merkle_finish(g_stream.kind == STREAM_AGGREGATE ? 3 : 9, a);",
      "merkle_finish(g_stream.kind == STREAM_AGGREGATE ? 3 : 8, a);"),
+    ("Gloas subtrees chained in the wrong order", "hash2(g_stream.subs[count], a, a);", "hash2(a, g_stream.subs[count], a);"),
 ]
 
 

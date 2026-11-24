@@ -13,6 +13,7 @@
 #define STREAM_AGGREGATE         0
 #define STREAM_AGGREGATE_ELECTRA 1
 #define STREAM_CONTRIBUTION      2
+#define STREAM_AGGREGATE_GLOAS   3
 
 int handler_enable(const uint8_t genesis_root[32]);
 int handler_sign_attestation(const uint8_t *data, const uint8_t *share);

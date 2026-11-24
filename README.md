@@ -29,7 +29,7 @@ Every request type of the [remote-signing API](https://github.com/ethereum/remot
 | Attestation | slashing record, then signs |
 | Block (header, Bellatrix and later) | slashing record, then signs |
 | Aggregation slot, RANDAO reveal | signs |
-| Aggregate and proof, before and since Electra | the bit list arrives in parts and is hashed as it comes, so its size needs no memory |
+| Aggregate and proof, in its three forms (before Electra, since Electra, since Gloas) | the bit list arrives in parts and is hashed as it comes, so its size needs no memory |
 | Sync committee message, selection proof, contribution and proof | signs |
 | Voluntary exit | asks on the screen |
 | Builder registration | only for the approved fee recipient and gas limit |
@@ -51,18 +51,18 @@ Today it talks to the emulator over TCP. A USB transport is still to write.
 | 22 examples, one per duty and fork: the signature verifies against the published signing root | [remote-signing-api](https://github.com/ethereum/remote-signing-api) |
 | The same examples as HTTP requests to the daemon, the device behind it | same |
 | Every accept and refuse of the 38 cases matches | [slashing-protection-interchange-tests](https://github.com/eth-clients/slashing-protection-interchange-tests) |
-| Aggregates with 22 sizes of bit list, from empty to the 131,072 bits of the limit, against a root computed apart from the device | this repository |
+| Aggregates with 38 sizes of bit list, from empty to the 131,072 bits of the limit, in the three forms, against a root computed apart from the device | this repository |
 | Exit: reject and approve, what the screen shows. Registration: another fee recipient, gas limit or network is refused | this repository |
 | 2-of-3 threshold: the three pairs sign for the group key, one share does not | this repository |
 | The record survives a restart; double and surround votes are still refused | this repository |
 | The screen names the network, and the host can't swap it during the approval | this repository |
 | Nothing is signed before a network is enabled | this repository |
 
-`tests/faults.py` breaks the app on purpose, one fault at a time (17 of them), and checks that the suite notices each one.
+`tests/faults.py` breaks the app on purpose, one fault at a time (18 of them), and checks that the suite notices each one.
 
 Signatures are verified with [py_ecc](https://github.com/ethereum/py_ecc), apart from the emulator's own BLS code.
 
-One example upstream does not match its content: `AGGREGATE_AND_PROOF_V2 (GLOAS)` has the same aggregate as the Fulu example and another signing root. The tests use the Fulu root for it.
+Gloas hashes an attestation another way ([EIP-7688](https://eips.ethereum.org/EIPS/eip-7688): progressive lists and containers). The Gloas aggregate example has the same content as the Fulu one and another root, and both are matched.
 
 ## What is missing
 
