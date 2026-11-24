@@ -10,7 +10,7 @@
 #include "bls_common.h"
 #include "get_pk.h"
 
-int handler_get_signing_pk(uint32_t index) {
+cx_err_t derive_signing_pk(uint32_t index, uint8_t out[48]) {
     uint32_t path[] = {PURPOSE, COIN_TYPE, index, 0, 0};
     cx_ecfp_384_private_key_t sk;
     cx_ecfp_384_public_key_t pk;
@@ -44,12 +44,21 @@ int handler_get_signing_pk(uint32_t index) {
         ret = cx_math_cmp_no_throw(tmp + 48, bls_field, 48, &cmp_diff);
     }
     if (ret != CX_OK) {
-        return io_send_sw(SW_BAD_STATE);
+        return ret;
     }
     if (cmp_diff > 0) {
         y_flag = 0x20;
     }
     pk.W[1] &= 0x1f;
     pk.W[1] |= 0x80 | y_flag;
-    return io_send_response_pointer(pk.W + 1, 48, SW_OK);
+    memcpy(out, pk.W + 1, 48);
+    return CX_OK;
+}
+
+int handler_get_signing_pk(uint32_t index) {
+    uint8_t pk[48];
+    if (derive_signing_pk(index, pk) != CX_OK) {
+        return io_send_sw(SW_BAD_STATE);
+    }
+    return io_send_response_pointer(pk, 48, SW_OK);
 }

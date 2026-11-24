@@ -55,6 +55,40 @@ int apdu_dispatcher(const command_t *cmd) {
             return size_is(cmd, 4) ? handler_get_mark(U4BE(cmd->data, 0))
                                    : io_send_sw(SW_WRONG_DATA_LENGTH);
 
+        case SIGN_AGGREGATION_SLOT:
+        case SIGN_RANDAO:
+            return size_is(cmd, DUTY_HEADER + 8) ? handler_sign_small(cmd->ins, cmd->data)
+                                                 : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case SIGN_SYNC_MESSAGE:
+            return size_is(cmd, DUTY_HEADER + 32) ? handler_sign_small(cmd->ins, cmd->data)
+                                                  : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case SIGN_SYNC_SELECTION:
+            return size_is(cmd, DUTY_HEADER + 16) ? handler_sign_small(cmd->ins, cmd->data)
+                                                  : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case STREAM_BEGIN:
+            return handler_stream_begin(cmd->data, cmd->lc);
+
+        case STREAM_BITS:
+            return handler_stream_bits(cmd->data, cmd->lc);
+
+        case STREAM_END:
+            return size_is(cmd, 192) ? handler_stream_end(cmd->data)
+                                     : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case SIGN_EXIT:
+            return size_is(cmd, DUTY_HEADER + 16) ? handler_sign_exit(cmd->data)
+                                                  : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case SET_FEE:
+            return size_is(cmd, 28) ? handler_set_fee(cmd->data) : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case SIGN_REGISTRATION:
+            return size_is(cmd, DUTY_HEADER + 36) ? handler_sign_registration(cmd->data)
+                                                  : io_send_sw(SW_WRONG_DATA_LENGTH);
+
 #ifdef TEST_BUILD
         case TEST_IMPORT_MARK:
             return size_is(cmd, 62) ? handler_import_mark(cmd->data)

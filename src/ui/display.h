@@ -1,6 +1,12 @@
 #pragma once
 
-/* Name of the network being enabled, or its genesis_validators_root in hex. */
-extern char g_network_str[2 + 64 + 1];
+#include <stdbool.h>
+#include <stdint.h>
 
-void ui_display_enable(void);
+/* What the device asks the user to approve: two lines naming the action, then one or two fields. */
+extern char g_confirm_action[2][16];
+extern char g_confirm_title[2][12];
+extern char g_confirm_text[2][2 + 64 + 1];
+
+/* Shows the screens, then calls `done` with the user's answer. */
+void ui_confirm(uint8_t fields, void (*done)(bool approved));

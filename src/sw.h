@@ -12,3 +12,7 @@
 #define SW_NOT_ENABLED 0xB102
 #define SW_BAD_KEY     0xB103
 #define SW_BUSY        0xB104
+/* A duty in several parts that does not hold together. */
+#define SW_BAD_DUTY 0xB105
+/* A registration for another fee recipient or gas limit than the ones approved on the device. */
+#define SW_SETTING 0xB106
