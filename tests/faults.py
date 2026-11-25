@@ -42,8 +42,25 @@ FAULTS = [
     ("Gloas subtrees chained in the wrong order", "hash2(g_stream.subs[count], a, a);", "hash2(a, g_stream.subs[count], a);"),
     ("keys in memory: only the first one is ever derived", "if ((g_sk_known & (1u << key)) == 0) {",
      "if (g_sk_known == 0) {", KEYS),
-    ("import: the tag is not checked", "    explicit_bzero(z, sizeof(z));\n    explicit_bzero(prk, sizeof(prk));",
-     "    ret = CX_OK;\n    explicit_bzero(z, sizeof(z));\n    explicit_bzero(prk, sizeof(prk));"),
+    # Ignoring the result of the decryption is not enough to plant this one: the library wipes
+    # what it decrypted when the tag is wrong, and a share of zero is refused. So the share is
+    # decrypted here without its tag being looked at.
+    ("import: the share is decrypted without its tag being checked",
+     "        ret = cx_aes_gcm_decrypt_and_auth(&gcm,\n"
+     "                                          (uint8_t *) ct,\n"
+     "                                          32,\n"
+     "                                          nonce,\n"
+     "                                          12,\n"
+     "                                          d,\n"
+     "                                          IMPORT_HEADER,\n"
+     "                                          g_import.secret,\n"
+     "                                          tag,\n"
+     "                                          16);\n",
+     "        (void) tag;\n"
+     "        ret = cx_aes_gcm_start(&gcm, CX_DECRYPT, nonce, 12);\n"
+     "        if (ret == CX_OK) {\n"
+     "            ret = cx_aes_gcm_update(&gcm, ct, g_import.secret, 32);\n"
+     "        }\n"),
     ("import: a share of zero or above the order is taken",
      "ret != CX_OK || diff >= 0 || cx_math_is_zero(g_import.secret, 32)", "ret != CX_OK"),
     ("import: the starting point is not stored", "        store_mark(MAX_KEYS + slot, &m);\n", ""),
