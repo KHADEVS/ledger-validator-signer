@@ -740,12 +740,33 @@ def test_import():
           emu.answer()[1] == 0x9000 and plain(shown(seen, "Not before")) == "source5,target7,slot101", str(seen[1:-1]))
     check("import again: the record did not go back", emu.send(ATTEST, vote(SLOT, root, 5, 7))[1] == SLASHABLE)
 
+    # Replacing a device: the key is split again and every holder takes its new share. A share of
+    # the old split is then of no use, and a holder that stays keeps its record.
+    new_slope = secrets.randbelow(curve_order - 1) + 1
+    new_shares = {i: (secret + new_slope * i) % curve_order for i in (1, 2, 3)}
+    for slot, index in ((0, 1), (1, 2), (2, 3)):
+        emu.write(IMPORT_SHARE, seal_share(device_pub, slot, index, group, new_shares[index]))
+        emu.choose("Approve")
+        assert emu.answer()[1] == 0x9000
+    check("new split: the record did not go back", emu.send(ATTEST, vote(SLOT, root, 5, 7))[1] == SLASHABLE)
+    body = attestation(96, 0, b"\2" * 32, 7, b"\3" * 32, 9, b"\4" * 32)
+    message = sha(data_root(body), domain(b"\1\0\0\0", b"\0\0\0\1", root))
+    fresh = {}
+    for slot, index in ((0, 1), (1, 2), (2, 3)):
+        fresh[index], sw = emu.send(ATTEST, header(SLOT + slot, b"\0\0\0\1", root) + body)
+        assert sw == 0x9000, hex(sw)
+    check("new split: the new shares sign for the same key",
+          all(bls.Verify(group, message, combine(fresh, pair)) for pair in ((1, 2), (1, 3), (2, 3))))
+    left_out = {1: fresh[1], 3: bls.Sign(shares[3], message)}
+    check("new split: a share of the old split does not combine with a new one",
+          not bls.Verify(group, message, combine(left_out, (1, 3))))
+
     emu.stop()
     emu = Emulator(fresh=False)
     check("import: the share is kept after a restart",
           emu.send(PUBKEY, struct.pack(">I", SLOT + 1))[0] == group + bytes([2]))
-    check("import: its record too", emu.send(ATTEST, vote(SLOT + 1, root, 5, 7))[1] == SLASHABLE)
-    check("import: and it signs the next vote", emu.send(ATTEST, vote(SLOT + 1, root, 7, 8))[1] == 0x9000)
+    check("import: its record too", emu.send(ATTEST, vote(SLOT + 1, root, 7, 9))[1] == SLASHABLE)
+    check("import: and it signs the next vote", emu.send(ATTEST, vote(SLOT + 1, root, 9, 10))[1] == 0x9000)
     emu.stop()
 
 
@@ -907,6 +928,37 @@ def test_combiner():
         ok = status == 200 and bls.Verify(public, unhex(examples[name]["signingRoot"]), unhex(json.loads(body)["signature"]))
         return ok, f"{status} {body[:80]}"
 
+    def arguments(n):
+        return ["--device", f"127.0.0.1:{emus[n].apdu}", "--listen", f"127.0.0.1:{9101 + n}", "--keys", "0"]
+
+    def stop(n):
+        daemons[n].terminate()
+        daemons[n].wait(20)
+
+    def start(n):
+        daemons[n] = start_daemon(exe, arguments(n), signers[n], f"signer-{n}.log")
+
+    def vote_request(source, target, block=b"\x11" * 32):
+        """An attestation with these epochs, in the form of the API, with its signing root."""
+        request = json.loads(json.dumps(examples["ATTESTATION"]))
+        data = request["attestation"]
+        data["slot"], data["beacon_block_root"] = str(32 * target), "0x" + block.hex()
+        data["source"]["epoch"], data["target"]["epoch"] = str(source), str(target)
+        body = attestation(32 * target, 0, block, source, unhex(data["source"]["root"]),
+                           target, unhex(data["target"]["root"]))
+        version = version_of(request["fork_info"]["fork"], target)
+        request["signingRoot"] = "0x" + sha(data_root(body), domain(b"\1\0\0\0", version, root)).hex()
+        return request
+
+    def vote_signed(request):
+        status, body = http("POST", f"{front}/api/v1/eth2/sign/{key}", request, "application/json")
+        ok = status == 200 and bls.Verify(group, unhex(request["signingRoot"]), unhex(json.loads(body)["signature"]))
+        return ok, f"{status} {body[:80]}"
+
+    def vote_refused(request):
+        status, body = http("POST", f"{front}/api/v1/eth2/sign/{key}", request, "application/json")
+        return status == 412, f"{status} {body[:80]}"
+
     try:
         for n in range(3):
             emu = Emulator(number=n)
@@ -920,8 +972,7 @@ def test_combiner():
                 emu.choose("Approve")
                 assert emu.answer()[1] == 0x9000
             emu.sock.close()  # its daemon takes the device from here
-            daemons.append(start_daemon(exe, ["--device", f"127.0.0.1:{emu.apdu}", "--listen", f"127.0.0.1:{9101 + n}",
-                                              "--keys", "0"], signers[n], f"signer-{n}.log"))
+            daemons.append(start_daemon(exe, arguments(n), signers[n], f"signer-{n}.log"))
         daemons.append(start_daemon(exe, ["--combine", ",".join(signers), "--listen", "127.0.0.1:9100"], front, "combiner.log"))
 
         check("combiner: a signer with shares offers no key of its own",
@@ -952,11 +1003,28 @@ def test_combiner():
         thread.join(200)
         check("combiner: an exit is signed once approved on the devices", *(answer[0] if answer else (False, "no answer")))
 
-        daemons[2].terminate()
-        daemons[2].wait(20)
+        stop(2)
         check("combiner: with one signer down, two still sign", *signed("SYNC_COMMITTEE_MESSAGE"))
-        daemons[1].terminate()
-        daemons[1].wait(20)
+
+        # A takeover. Two devices sign a vote while the third is down. Then the third is back and
+        # one of the two is gone: the new pair has one device in common with the old one, and that
+        # device holds the vote in its own record. Nothing is handed over between devices.
+        check("takeover: two devices sign a vote while the third is down", *vote_signed(vote_request(10, 20)))
+        start(2)
+        stop(0)
+        check("takeover: the other pair is refused a vote that surrounds it", *vote_refused(vote_request(9, 21)))
+        alone = http("POST", f"{signers[2]}/partial/v1/eth2/sign/{key}", vote_request(9, 22), "application/json")[0]
+        check("takeover: the device that was down would sign such a vote, the common one refused", alone == 200, str(alone))
+        start(0)
+        stop(2)
+        check("takeover: the first pair signs a later vote", *vote_signed(vote_request(30, 40)))
+        start(2)
+        stop(0)
+        check("takeover: the other pair is refused a second vote for the same target",
+              *vote_refused(vote_request(30, 40, block=b"\x22" * 32)))
+        check("takeover: and it signs the vote after that", *vote_signed(vote_request(31, 41)))
+
+        stop(1)
         status, body = http("POST", f"{front}/api/v1/eth2/sign/{key}", examples["SYNC_COMMITTEE_SELECTION_PROOF"], "application/json")
         check("combiner: with two signers down, nothing is signed", status == 500, f"{status} {body[:90]}")
     finally:
