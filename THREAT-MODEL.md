@@ -53,6 +53,7 @@ Does not have the device in hand, and does not know its PIN.
 - **A slot can be given to another key.** The first key's record goes with it, and importing that key again later starts from what the new import says. It takes two presses on the device.
 - **The combiner and the daemons speak plain HTTP.** They hold no secret and can't make a device sign a root of their choice, but anyone on that network can ask for signatures of valid duties. They belong on a private network.
 - **A daemon or a combiner that lies** can do what a compromised host does with a single device, and no more: stop the signing, or have the devices vote for a head of its choice. It can't get a key, a slashable pair, an exit without a press or another fee recipient.
+- **The device runs unlocked.** A locked Ledger answers no command: the SDK refuses them before the app sees them. So the device's automatic PIN lock has to be off while it signs, as for Tezos bakers. Whoever reaches the device can then press its buttons: approve an exit or a setting the host asks for, or close the app. They can't read a key. The PIN protects a device that is switched off, not one that signs. Locking the device when the app is closed is not written.
 - **Flash wear.** Every attestation writes one record. The number of writes the chip takes has not been measured.
 - **A device that waits for a press signs nothing else**, so a host can stall a validator by asking for exits. This costs liveness only.
 - **Power cut during a record write** is handled by design and not tested.
