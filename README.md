@@ -16,7 +16,7 @@ The goal: getting root on the host gives an attacker neither the validator key n
 - **A builder registration is signed only for the fee recipient and gas limit approved on the device**, and the public key in it is the device's own, not one sent by the host.
 - **A key can be held as shares, one per device.** A share is imported encrypted to a key made inside the device, which shows what it imports and asks. Two devices of three then sign for the key, and a small combiner gives the validator client the key's signature. Any two pairs of devices have one in common, and that one refuses the conflicting vote.
 
-Keys are derived on the device at `m/12381/3600/i/0/0` ([EIP-2334](https://eips.ethereum.org/EIPS/eip-2334)). The app can't derive anything else. A key is derived once and stays in the secure element's memory while the app runs: the derivation costs thousands of hashes, too many to redo for every signature.
+Keys are derived on the device at `m/12381/3600/i/0/0` ([EIP-2334](https://eips.ethereum.org/EIPS/eip-2334)). The app can't derive anything else. A key is derived once and stays in the secure element's memory while the app runs: on the chip the derivation takes about a second per level of the path ([measured](#what-is-missing)), too long to redo for every signature.
 
 ## Key shares
 
@@ -81,7 +81,7 @@ Gloas hashes an attestation another way ([EIP-7688](https://eips.ethereum.org/EI
 
 ## What is missing
 
-- **A physical device.** The emulator runs BLS on the host, so the time per signature on the chip is unknown, and so is the flash wear. Tezos's developers [found](https://research-development.nomadic-labs.com/seoul-is-live.html) BLS signing on Ledger devices too slow for their chain, where a key signs twice per block, and a block comes every few seconds. An Ethereum validator signs one attestation per epoch, so the same chip may serve a few validators where it could not serve a Tezos baker. Measuring it comes before anything else.
+- **A physical device.** The emulator runs BLS on the host, and the app has not run on the chip. What is measured so far is the key derivation, through Ledger's Ethereum app, which computes a BLS public key for a path under `m/12381/3600` without a confirmation. On a Ledger Flex, which has [the same secure element](https://developers.ledger.com/docs/device-app/explanation/ledger-os/hardware-architecture) as the Nano S Plus, at five path depths and five runs each: 1.09 s for one level of EIP-2333 derivation, so 5.4 s for a validator key, and 0.27 s for the rest of the command, one multiplication in G1 included. The signature itself, a hash to G2 and a multiplication in G2, is not timed yet, and neither is the flash wear. Tezos's developers [found](https://research-development.nomadic-labs.com/seoul-is-live.html) BLS signing on Ledger devices too slow for their chain, where a key signs twice per block; their app derived the key [twice for every signature](https://github.com/trilitech/ledger-app-tezos-baking/blob/17bb4f87b12eb09193026991fa790c9662c23345/src/crypto.c#L157-L159). An Ethereum validator's regular duties are two signatures per epoch. Timing the signature on a Nano S Plus comes before anything else.
 - **Real validator clients.** The daemon passes the API's examples; no client has been run against it.
 - The Gloas payload duties.
 - EIP-3076 import and export for the keys derived on the device. A share brings its starting point with it; a derived key is new and has none.
