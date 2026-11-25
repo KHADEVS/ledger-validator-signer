@@ -9,7 +9,7 @@ A first version, for the prototype. It says what the design is meant to hold aga
 3. **Where the rewards go.** The fee recipient in a builder registration.
 4. **The validator's life.** A voluntary exit is not signed without a person.
 
-Liveness is not protected. An attacker on the host can always stop the validator from signing.
+Liveness is not protected, and neither is the choice of what to vote for. An attacker on the host can always stop the validator from signing, or have it vote for a head of their choosing. Neither can be slashed.
 
 ## The attacker
 
@@ -21,7 +21,10 @@ Does not have the device in hand, and does not know its PIN.
 
 | Property | Mechanism | Tested by |
 | --- | --- | --- |
-| The key stays inside | Derived in the secure element (EIP-2333). No command returns it. | no test can show an absence; see the command list |
+| The key stays inside | Derived in the secure element (EIP-2333) and kept in its memory while the app runs, or imported as a share. No command returns either. | no test can show an absence; see the command list |
+| A share arrives intact and unseen | Sealed to a key made in the device (ECDH on P-256, HKDF-SHA256, AES-256-GCM), with the slot, the share's number, the validator's key and its starting point authenticated. The screen shows them and asks. | import tests: 16 ways to tamper, reject, what the screen shows |
+| | The device shows a check of its import key, to compare with the one shown where the share is sealed. | import key test |
+| A share's record can't go back | Its record starts where the import says. The same share again keeps the higher of the two; the same share in another slot is refused. | import tests |
 | No slashable signature | The device parses the duty and computes the signing root. There is no command that signs a given root. | `a root given by the host is never signed` |
 | | The record is checked and written to flash before the signature is made. | EIP-3076 interchange tests, 38 cases |
 | | Two records alternate per key, with a counter and a checksum. A write cut short leaves the older one valid. | restart test (a power cut during the write is not tested) |
@@ -30,7 +33,7 @@ Does not have the device in hand, and does not know its PIN.
 | | The network is fixed by a choice made on the device's screen. A duty for another network is refused. | enabling tests |
 | Fee recipient | Set with a press, shown in full. A registration for another one is refused. The key in the registration is the device's own. | registration tests |
 | Exit | Asked on the screen every time, with the validator index and the epoch. | exit tests |
-| With 2-of-3 | Any two quorums share a device. That device's record refuses the second, conflicting duty. | threshold test (the record of a share is the same code) |
+| With 2-of-3 | Any two pairs of shares have one in common. Its record refuses the second, conflicting duty. Each share has its own record. | import tests, and three devices behind the combiner |
 
 ## What the design trusts
 
@@ -38,13 +41,18 @@ Does not have the device in hand, and does not know its PIN.
 - **The person who presses the buttons**, to read the network, the fee recipient and the exit they approve.
 - **The build.** An operator installs the app by hand, so they must check that the binary is the one the source gives. Builds are meant to be reproducible; this is not set up yet.
 - **The recovery phrase.** A key derived from it can be restored on a second device, and two devices with the same key and separate records can sign a slashable pair. Threshold shares avoid this, as long as each share lives on one device.
+- **The machine where a key is split.** The whole key is there once, in clear, and so are the shares before they are sealed. It should be offline and wiped afterwards. A key generation between the devices would remove it; it is not written.
+- **The person who imports a share**, to compare the check of the import key, and to read the validator's key and the starting point on the screen. A starting point set too early lets the device sign again what the validator signed elsewhere.
 
 ## What does not hold yet
 
 - **The fork version comes from the host.** A wrong one gives a signature that is valid on no real fork, so it cannot be used to slash. A version of another network with the same `genesis_validators_root` would be a problem; none exists to my knowledge.
 - **The validator index of an exit is not checked against the key.** The device cannot know which index its key has. The person reads it on the screen.
 - **Sync committee messages sign a root the host gives**, under the sync committee domain. That is the duty itself: the message is a block root. It is not slashable.
-- **Shares come from the host in test builds.** A real threshold setup needs a key generation between devices, which is not written.
+- **The device can't tell a share from any other number.** A share that does not belong to the key gives partial signatures that don't combine. The combiner finds it when the request carries its signing root; without it, the validator client is the one to reject the signature.
+- **A slot can be given to another key.** The first key's record goes with it, and importing that key again later starts from what the new import says. It takes two presses on the device.
+- **The combiner and the daemons speak plain HTTP.** They hold no secret and can't make a device sign a root of their choice, but anyone on that network can ask for signatures of valid duties. They belong on a private network.
+- **A daemon or a combiner that lies** can do what a compromised host does with a single device, and no more: stop the signing, or have the devices vote for a head of its choice. It can't get a key, a slashable pair, an exit without a press or another fee recipient.
 - **Flash wear.** Every attestation writes one record. The number of writes the chip takes has not been measured.
 - **A device that waits for a press signs nothing else**, so a host can stall a validator by asking for exits. This costs liveness only.
 - **Power cut during a record write** is handled by design and not tested.

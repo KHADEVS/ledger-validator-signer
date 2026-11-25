@@ -9,6 +9,8 @@
  * - A voluntary exit needs a press each time. A builder registration is signed only for the fee
  *   recipient and gas limit that were approved on the device.
  * - Every other duty gets its own domain here, so none of them can come out as a block or a vote.
+ * - A key share can be imported, encrypted to a key made in the device. The device shows what it
+ *   imports and from which point it will sign, and asks. A slot then signs every duty like a key.
  */
 
 #include <string.h>
@@ -27,7 +29,10 @@
 #include "get_pk.h"
 #include "validator.h"
 
-#define MAX_KEYS 32
+#define MAX_KEYS DERIVED_KEYS
+/* Key numbers from MAX_KEYS up are the slots of imported key shares. */
+#define MAX_SHARES 4
+#define SLOTS      (MAX_KEYS + MAX_SHARES)
 /* MAX_VALIDATORS_PER_COMMITTEE, and the same times MAX_COMMITTEES_PER_SLOT since Electra. */
 #define LIMIT_BITS         2048
 #define LIMIT_BITS_ELECTRA 131072
@@ -45,11 +50,21 @@ typedef struct {
 } mark_t;
 
 typedef struct {
+    uint8_t present;
+    uint8_t index;        /* which share of the key: 1, 2, 3... */
+    uint8_t secret[32];   /* big endian */
+    uint8_t group_pk[48]; /* the validator's public key */
+} share_t;
+
+typedef struct {
     uint8_t enabled;
     uint8_t genesis_root[32];
     uint8_t fee_set;
     uint8_t fee[28]; /* fee recipient 20 | gas limit 8, little endian */
-    mark_t marks[MAX_KEYS][2];
+    mark_t marks[SLOTS][2];
+    uint8_t import_set;
+    uint8_t import_sk[32]; /* the P-256 key that shares are encrypted to */
+    share_t shares[MAX_SHARES];
 } nv_t;
 
 const nv_t N_nv_real;
@@ -204,7 +219,6 @@ static void attestation_data_root(const uint8_t *a, uint8_t out[32]) {
 
 static int sign_root(uint32_t key, const uint8_t *share, const uint8_t root[32]) {
     static const uint8_t dst[] = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    uint32_t path[] = {PURPOSE, COIN_TYPE, key, 0, 0};
     cx_ecfp_384_private_key_t sk;
     uint8_t hash[192], sig[96], raw[48];
     cx_err_t ret = cx_hash_to_field(root, 32, dst, sizeof(dst) - 1, hash, sizeof(hash));
@@ -217,8 +231,16 @@ static int sign_root(uint32_t key, const uint8_t *share, const uint8_t root[32])
                                                     sizeof(raw),
                                                     (cx_ecfp_private_key_t *) &sk);
             explicit_bzero(raw, sizeof(raw));
+        } else if (key >= MAX_KEYS) {
+            memset(raw, 0, 16);
+            memcpy(raw + 16, (const void *) N_nv.shares[key - MAX_KEYS].secret, 32);
+            ret = cx_ecfp_init_private_key_no_throw(CX_CURVE_BLS12_381_G1,
+                                                    raw,
+                                                    sizeof(raw),
+                                                    (cx_ecfp_private_key_t *) &sk);
+            explicit_bzero(raw, sizeof(raw));
         } else {
-            ret = get_bls_sk(path, 5, &sk);
+            ret = get_signing_sk(key, &sk);
         }
     }
     if (ret == CX_OK) {
@@ -234,7 +256,7 @@ static int sign_root(uint32_t key, const uint8_t *share, const uint8_t root[32])
 /* Reads key | version | genesis root, and refuses a key or a network not enabled. */
 static int check_duty(const uint8_t *d, uint32_t *key) {
     *key = U4BE(d, 0);
-    if (*key >= MAX_KEYS) {
+    if (*key >= SLOTS || (*key >= MAX_KEYS && N_nv.shares[*key - MAX_KEYS].present != 1)) {
         return SW_BAD_KEY;
     }
     if (N_nv.enabled != 1 || memcmp((const void *) N_nv.genesis_root, d + 8, 32) != 0) {
@@ -300,7 +322,7 @@ int handler_sign_block(const uint8_t *d) {
 
 int handler_get_mark(uint32_t key) {
     mark_t m;
-    if (key >= MAX_KEYS) {
+    if (key >= SLOTS) {
         return io_send_sw(SW_BAD_KEY);
     }
     load_mark(key, &m);
@@ -668,6 +690,15 @@ int handler_set_fee(const uint8_t *d) {
     return 0;
 }
 
+/* The validator's public key: derived here, or the one a share was imported for. */
+static cx_err_t signing_pk(uint32_t key, uint8_t pk[48]) {
+    if (key >= MAX_KEYS) {
+        memcpy(pk, (const void *) N_nv.shares[key - MAX_KEYS].group_pk, 48);
+        return CX_OK;
+    }
+    return derive_signing_pk(key, pk);
+}
+
 /*
  * Builder registration: header | fee recipient 20 | gas limit 8 | timestamp 8.
  * The public key in the message is the device's own. The version in the header is the genesis
@@ -685,7 +716,7 @@ int handler_sign_registration(const uint8_t *d) {
     if (N_nv.fee_set != 1 || memcmp((const void *) N_nv.fee, r, 28) != 0) {
         return io_send_sw(SW_SETTING);
     }
-    if (derive_signing_pk(key, pk) != CX_OK) {
+    if (signing_pk(key, pk) != CX_OK) {
         return io_send_sw(SW_BAD_STATE);
     }
     memset(leaf, 0, sizeof(leaf));
@@ -701,12 +732,268 @@ int handler_sign_registration(const uint8_t *d) {
     return sign_root(key, NULL, root);
 }
 
+/* The public key of a key, and for a slot the number of the share it holds. */
+int handler_get_pk(uint32_t key) {
+    uint8_t out[49];
+    if (key < MAX_KEYS) {
+        return handler_get_signing_pk(key);
+    }
+    if (key >= SLOTS || N_nv.shares[key - MAX_KEYS].present != 1) {
+        return io_send_sw(SW_BAD_KEY);
+    }
+    memcpy(out, (const void *) N_nv.shares[key - MAX_KEYS].group_pk, 48);
+    out[48] = N_nv.shares[key - MAX_KEYS].index;
+    return io_send_response_pointer(out, sizeof(out), SW_OK);
+}
+
+/* The P-256 key that shares are encrypted to. It is made here at first use and never leaves. */
+static cx_err_t import_key(cx_ecfp_256_private_key_t *priv, cx_ecfp_256_public_key_t *pub) {
+    uint8_t raw[32];
+    cx_err_t ret;
+    if (N_nv.import_set != 1) {
+        uint8_t flag = 1;
+        ret = cx_ecfp_generate_pair_no_throw(CX_CURVE_SECP256R1,
+                                             (cx_ecfp_public_key_t *) pub,
+                                             (cx_ecfp_private_key_t *) priv,
+                                             0);
+        if (ret == CX_OK) {
+            nvm_write((void *) N_nv.import_sk, priv->d, 32);
+            nvm_write((void *) &N_nv.import_set, &flag, 1);
+        }
+        return ret;
+    }
+    memcpy(raw, (const void *) N_nv.import_sk, 32);
+    ret = cx_ecfp_init_private_key_no_throw(CX_CURVE_SECP256R1,
+                                            raw,
+                                            sizeof(raw),
+                                            (cx_ecfp_private_key_t *) priv);
+    explicit_bzero(raw, sizeof(raw));
+    if (ret == CX_OK) {
+        ret = cx_ecfp_generate_pair_no_throw(CX_CURVE_SECP256R1,
+                                             (cx_ecfp_public_key_t *) pub,
+                                             (cx_ecfp_private_key_t *) priv,
+                                             1);
+    }
+    return ret;
+}
+
+static uint8_t g_import_pub[65];
+
+static void import_key_choice(bool approved) {
+    if (!g_pending) {
+        return;
+    }
+    g_pending = false;
+    if (!approved) {
+        io_send_sw(SW_DENY);
+        return;
+    }
+    io_send_response_pointer(g_import_pub, sizeof(g_import_pub), SW_OK);
+}
+
+/*
+ * Gives the key to encrypt a share to. The screen shows a check of it, to compare with the one
+ * shown where the share is encrypted: a host in between cannot put its own key in its place.
+ */
+int handler_get_import_key(void) {
+    cx_ecfp_256_private_key_t priv;
+    cx_ecfp_256_public_key_t pub;
+    uint8_t digest[32];
+    if (g_pending) {
+        return io_send_sw(SW_BUSY);
+    }
+    cx_err_t ret = import_key(&priv, &pub);
+    explicit_bzero(&priv, sizeof(priv));
+    if (ret != CX_OK) {
+        return io_send_sw(SW_BAD_STATE);
+    }
+    memcpy(g_import_pub, pub.W, sizeof(g_import_pub));
+    cx_hash_sha256(g_import_pub, sizeof(g_import_pub), digest, sizeof(digest));
+    screen_action("Show", "import key");
+    strlcpy(g_confirm_title[0], "Key check", sizeof(g_confirm_title[0]));
+    format_hex(digest, 8, g_confirm_text[0], sizeof(g_confirm_text[0]));
+    g_pending = true;
+    ui_confirm(1, import_key_choice);
+    return 0;
+}
+
+static struct {
+    uint8_t header[IMPORT_HEADER];
+    uint8_t secret[32];
+} g_import;
+
+/* The order of the group: a share is a number below it, and not zero. */
+static const uint8_t BLS_ORDER[32] = {0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8,
+                                      0x08, 0x09, 0xa1, 0xd8, 0x05, 0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe,
+                                      0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01};
+
+static void import_choice(bool approved) {
+    if (!g_pending) {
+        return;
+    }
+    g_pending = false;
+    if (approved) {
+        const uint8_t *h = g_import.header;
+        uint8_t slot = h[0], flag = 0;
+        share_t s;
+        mark_t m, zero[2];
+        /* The slot is empty while it is rewritten. Its record starts where the import says. */
+        nvm_write((void *) &N_nv.shares[slot].present, &flag, 1);
+        memset(zero, 0, sizeof(zero));
+        nvm_write((void *) &N_nv.marks[MAX_KEYS + slot], zero, sizeof(zero));
+        memset(&m, 0, sizeof(m));
+        m.has_attestation = h[74] & 1;
+        m.has_block = (h[74] >> 1) & 1;
+        m.source = le64(h + 50);
+        m.target = le64(h + 58);
+        m.block_slot = le64(h + 66);
+        store_mark(MAX_KEYS + slot, &m);
+        memset(&s, 0, sizeof(s));
+        s.index = h[1];
+        memcpy(s.secret, g_import.secret, sizeof(s.secret));
+        memcpy(s.group_pk, h + 2, sizeof(s.group_pk));
+        nvm_write((void *) &N_nv.shares[slot], &s, sizeof(s));
+        explicit_bzero(&s, sizeof(s));
+        flag = 1;
+        nvm_write((void *) &N_nv.shares[slot].present, &flag, 1);
+    }
+    explicit_bzero(&g_import, sizeof(g_import));
+    io_send_sw(approved ? SW_OK : SW_DENY);
+}
+
+/*
+ * A share of a validator key, encrypted to the device: ECDH on P-256 with a key of the sender made
+ * for this message, HKDF-SHA256, AES-256-GCM. Everything in clear before the sender's key is
+ * authenticated with the share: the slot, the share's number, the validator's public key, and
+ * what the validator signed before (the record starts there, as in an EIP-3076 import).
+ */
+int handler_import_share(const uint8_t *d) {
+    static const char label[] = "ledger-validator-signer share import v1";
+    cx_ecfp_256_private_key_t priv;
+    cx_ecfp_256_public_key_t pub;
+    cx_aes_gcm_context_t gcm;
+    uint8_t z[32], prk[32], k[32], zero[32] = {0};
+    uint8_t info[sizeof(label) - 1 + 65 + 65 + 1];
+    const uint8_t *sender = d + IMPORT_HEADER, *nonce = sender + 65, *ct = nonce + 12, *tag = ct + 32;
+    uint64_t source = le64(d + 50), target = le64(d + 58), block_slot = le64(d + 66);
+    const uint64_t limit = 1000000000000ULL; /* keeps the numbers readable on the screen */
+    int diff = 0;
+
+    if (g_pending) {
+        return io_send_sw(SW_BUSY);
+    }
+    if (d[0] >= MAX_SHARES || d[1] == 0 || (d[74] & ~3) != 0 || N_nv.import_set != 1 ||
+        source >= limit || target >= limit || block_slot >= limit) {
+        return io_send_sw(SW_BAD_IMPORT);
+    }
+    /* A share already held in another slot would get a second record. */
+    for (uint8_t i = 0; i < MAX_SHARES; i++) {
+        if (i != d[0] && N_nv.shares[i].present == 1 &&
+            N_nv.shares[i].index == d[1] &&
+            memcmp((const void *) N_nv.shares[i].group_pk, d + 2, 48) == 0) {
+            return io_send_sw(SW_BAD_IMPORT);
+        }
+    }
+    cx_err_t ret = import_key(&priv, &pub);
+    if (ret == CX_OK) {
+        ret = cx_ecdh_no_throw((cx_ecfp_private_key_t *) &priv, CX_ECDH_X, sender, 65, z, sizeof(z));
+    }
+    explicit_bzero(&priv, sizeof(priv));
+    if (ret == CX_OK) {
+        /* HKDF-SHA256 with an empty salt. The two public keys are part of the context. */
+        cx_hmac_sha256(zero, sizeof(zero), z, sizeof(z), prk, sizeof(prk));
+        memcpy(info, label, sizeof(label) - 1);
+        memcpy(info + sizeof(label) - 1, sender, 65);
+        memcpy(info + sizeof(label) - 1 + 65, pub.W, 65);
+        info[sizeof(info) - 1] = 1;
+        cx_hmac_sha256(prk, sizeof(prk), info, sizeof(info), k, sizeof(k));
+        cx_aes_gcm_init(&gcm);
+        ret = cx_aes_gcm_set_key(&gcm, k, sizeof(k));
+    }
+    if (ret == CX_OK) {
+        ret = cx_aes_gcm_decrypt_and_auth(&gcm,
+                                          (uint8_t *) ct,
+                                          32,
+                                          nonce,
+                                          12,
+                                          d,
+                                          IMPORT_HEADER,
+                                          g_import.secret,
+                                          tag,
+                                          16);
+    }
+    explicit_bzero(z, sizeof(z));
+    explicit_bzero(prk, sizeof(prk));
+    explicit_bzero(k, sizeof(k));
+    explicit_bzero(&gcm, sizeof(gcm));
+    if (ret == CX_OK) {
+        ret = cx_math_cmp_no_throw(g_import.secret, BLS_ORDER, 32, &diff);
+    }
+    if (ret != CX_OK || diff >= 0 || cx_math_is_zero(g_import.secret, 32)) {
+        explicit_bzero(&g_import, sizeof(g_import));
+        return io_send_sw(SW_BAD_IMPORT);
+    }
+    memcpy(g_import.header, d, IMPORT_HEADER);
+
+    /* The same key in the same slot keeps the higher of the two records. */
+    if (N_nv.shares[d[0]].present == 1 &&
+        memcmp((const void *) N_nv.shares[d[0]].group_pk, d + 2, 48) == 0) {
+        mark_t old;
+        load_mark(MAX_KEYS + d[0], &old);
+        if (old.has_attestation) {
+            source = old.source > source || !(d[74] & 1) ? old.source : source;
+            target = old.target > target || !(d[74] & 1) ? old.target : target;
+            g_import.header[74] |= 1;
+        }
+        if (old.has_block) {
+            block_slot = old.block_slot > block_slot || !(d[74] & 2) ? old.block_slot : block_slot;
+            g_import.header[74] |= 2;
+        }
+        for (int i = 0; i < 8; i++) {
+            g_import.header[50 + i] = (uint8_t) (source >> (8 * i));
+            g_import.header[58 + i] = (uint8_t) (target >> (8 * i));
+            g_import.header[66 + i] = (uint8_t) (block_slot >> (8 * i));
+        }
+    }
+
+    char *t = g_confirm_text[0];
+    size_t size = sizeof(g_confirm_text[0]);
+    screen_action("Import", "key share");
+    strlcpy(g_confirm_title[0], "Slot", sizeof(g_confirm_title[0]));
+    format_u64(t, size, d[0]);
+    strlcat(t, ", share ", size);
+    format_u64(t + strlen(t), size - strlen(t), d[1]);
+
+    t = g_confirm_text[1];
+    strlcpy(g_confirm_title[1], "Group key", sizeof(g_confirm_title[1]));
+    memcpy(t, "0x", 2);
+    format_hex(d + 2, 6, t + 2, size - 2);
+    strlcat(t, "..", size);
+    format_hex(d + 2 + 42, 6, t + strlen(t), size - strlen(t));
+
+    t = g_confirm_text[2];
+    strlcpy(g_confirm_title[2], "Not before", sizeof(g_confirm_title[2]));
+    if (g_import.header[74] == 0) {
+        strlcpy(t, "nothing signed yet", size);
+    } else {
+        strlcpy(t, "source ", size);
+        format_u64(t + strlen(t), size - strlen(t), source);
+        strlcat(t, ", target ", size);
+        format_u64(t + strlen(t), size - strlen(t), target);
+        strlcat(t, ", slot ", size);
+        format_u64(t + strlen(t), size - strlen(t), block_slot);
+    }
+    g_pending = true;
+    ui_confirm(3, import_choice);
+    return 0;
+}
+
 #ifdef TEST_BUILD
 /* Test builds only: raise a record, and forget everything between two test cases. */
 int handler_import_mark(const uint8_t *d) {
     uint32_t key = U4BE(d, 0);
     mark_t m;
-    if (key >= MAX_KEYS) {
+    if (key >= SLOTS) {
         return io_send_sw(SW_BAD_KEY);
     }
     if (N_nv.enabled != 1 || memcmp((const void *) N_nv.genesis_root, d + 30, 32) != 0) {
@@ -729,10 +1016,16 @@ int handler_import_mark(const uint8_t *d) {
 
 int handler_reset(void) {
     mark_t zero[2];
+    share_t none;
     memset(zero, 0, sizeof(zero));
-    for (int i = 0; i < MAX_KEYS; i++) {
+    memset(&none, 0, sizeof(none));
+    for (int i = 0; i < SLOTS; i++) {
         nvm_write((void *) &N_nv.marks[i], zero, sizeof(zero));
     }
+    for (int i = 0; i < MAX_SHARES; i++) {
+        nvm_write((void *) &N_nv.shares[i], &none, sizeof(none));
+    }
+    forget_signing_sks();
     return io_send_sw(SW_OK);
 }
 #endif

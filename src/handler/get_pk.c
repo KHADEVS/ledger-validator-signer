@@ -11,7 +11,6 @@
 #include "get_pk.h"
 
 cx_err_t derive_signing_pk(uint32_t index, uint8_t out[48]) {
-    uint32_t path[] = {PURPOSE, COIN_TYPE, index, 0, 0};
     cx_ecfp_384_private_key_t sk;
     cx_ecfp_384_public_key_t pk;
     uint8_t y_flag = 0;
@@ -21,7 +20,7 @@ cx_err_t derive_signing_pk(uint32_t index, uint8_t out[48]) {
     cx_err_t ret;
 
     memset(tmp, 0, sizeof(tmp));
-    ret = get_bls_sk(path, 5, &sk);
+    ret = get_signing_sk(index, &sk);
     if (ret == CX_OK) {
         ret = cx_ecfp_generate_pair_no_throw(CX_CURVE_BLS12_381_G1,
                                              (cx_ecfp_public_key_t *) &pk,

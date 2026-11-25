@@ -7,11 +7,15 @@ With --release, checks instead that a release build has no test command.
 - exits (a press each time) and builder registrations (only for the approved fee recipient);
 - EIP-3076 interchange tests, minimal strategy: every accept and refuse must match;
 - 2-of-3 threshold: two partial signatures give the group's signature;
-- restart: the slashing record survives a power cycle;
+- several keys in turn: each signs with its own key, also once the keys are kept in memory;
+- import of key shares, encrypted to the device and approved on its screen: what is tampered with
+  is refused, the record starts where the import says, and three slots sign as 2 of 3;
+- restart: the slashing record and the imported shares survive a power cycle;
 - the daemon: the same API examples over HTTP, with the device behind it.
 
 Environment: APP (the .elf), SPECULOS (the command), DATA (see fetch.sh), WORK (a scratch folder),
-DAEMON (the daemon's binary; without it, the daemon is not tested).
+DAEMON (the daemon's binary; without it, the daemon is not tested), STOP_AT_FIRST_FAILURE (any
+value: the suite stops at the first check that fails, which is all the fault runner needs).
 """
 import glob
 import hashlib
@@ -30,6 +34,10 @@ import urllib.error
 import urllib.request
 
 import yaml
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from py_ecc.bls import G2ProofOfPossession as bls
 from py_ecc.bls.g2_primitives import G1_to_pubkey, G2_to_signature, signature_to_G2
 from py_ecc.optimized_bls12_381 import G1, add, curve_order, multiply
@@ -39,13 +47,14 @@ APP = os.path.abspath(os.environ.get("APP", f"{HERE}/../build/nanos2/bin/app.elf
 DATA = os.path.abspath(os.environ.get("DATA", f"{HERE}/data"))
 WORK = os.path.abspath(os.environ.get("WORK", f"{tempfile.gettempdir()}/validator-signer"))
 SPECULOS = os.environ.get("SPECULOS", "speculos")
-API = "http://127.0.0.1:5000"
 
 DENIED, BAD_LENGTH, UNKNOWN_COMMAND = 0x6985, 0x6A87, 0x6D00
 SLASHABLE, NOT_ENABLED, BAD_KEY, BAD_DUTY, SETTING = 0xB101, 0xB102, 0xB103, 0xB105, 0xB106
 PUBKEY, ENABLE, ATTEST, BLOCK, MARK, IMPORT, RESET, SHARE = 0x06, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26
 AGGREGATION_SLOT, RANDAO, SYNC_MESSAGE, SYNC_SELECTION = 0x27, 0x28, 0x29, 0x2A
 BEGIN, BITS, END, EXIT, SET_FEE, REGISTRATION = 0x2C, 0x2D, 0x2E, 0x30, 0x31, 0x32
+GET_IMPORT_KEY, IMPORT_SHARE, BAD_IMPORT = 0x33, 0x34, 0xB107
+SLOT = 32  # key numbers from here up are the slots of imported shares
 CONTRIBUTION = b"\2"
 BEFORE_ELECTRA, ELECTRA, GLOAS = 0, 1, 3  # how an aggregate is laid out and hashed
 MAINNET = bytes.fromhex("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95")
@@ -54,23 +63,26 @@ SEPOLIA = bytes.fromhex("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac0
 
 
 class Emulator:
-    current = None
+    running = []
 
-    def __init__(self, fresh=True):
+    def __init__(self, fresh=True, number=0):
+        """`number`: several devices at once, each with its own ports and its own memory."""
+        self.work = WORK if number == 0 else f"{WORK}-{number}"
+        self.apdu, self.api = 9999 - number, f"http://127.0.0.1:{5000 + number}"
         if fresh:
-            shutil.rmtree(WORK, ignore_errors=True)
-        os.makedirs(WORK, exist_ok=True)
-        args = [SPECULOS, "--display", "headless", "--model", "nanosp", "--apdu-port", "9999",
-                "--api-port", "5000", "--save-nvram"] + ([] if fresh else ["--load-nvram"])
-        self.log = open(f"{WORK}/speculos.log", "a")
-        self.proc = subprocess.Popen(args + [APP], cwd=WORK, stdout=self.log, stderr=self.log)
-        Emulator.current = self
+            shutil.rmtree(self.work, ignore_errors=True)
+        os.makedirs(self.work, exist_ok=True)
+        args = [SPECULOS, "--display", "headless", "--model", "nanosp", "--apdu-port", str(self.apdu),
+                "--api-port", str(5000 + number), "--save-nvram"] + ([] if fresh else ["--load-nvram"])
+        self.log = open(f"{self.work}/speculos.log", "a")
+        self.proc = subprocess.Popen(args + [APP], cwd=self.work, stdout=self.log, stderr=self.log)
+        Emulator.running.append(self)
         for _ in range(80):
             time.sleep(0.25)
             if self.proc.poll() is not None:
-                raise SystemExit(f"the emulator stopped, see {WORK}/speculos.log")
+                raise SystemExit(f"the emulator stopped, see {self.work}/speculos.log")
             try:
-                self.sock = socket.create_connection(("127.0.0.1", 9999), timeout=60)
+                self.sock = socket.create_connection(("127.0.0.1", self.apdu), timeout=60)
                 self.screen()
                 return
             except OSError:
@@ -81,7 +93,8 @@ class Emulator:
         self.sock.close()
         self.proc.terminate()
         self.proc.wait(20)
-        Emulator.current = None
+        if self in Emulator.running:
+            Emulator.running.remove(self)
 
     def read(self, n):
         out = b""
@@ -106,13 +119,13 @@ class Emulator:
         return self.answer()
 
     def press(self, which):
-        req = urllib.request.Request(f"{API}/button/{which}", method="POST",
+        req = urllib.request.Request(f"{self.api}/button/{which}", method="POST",
                                      data=json.dumps({"action": "press-and-release"}).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10).read()
 
     def screen(self):
-        raw = urllib.request.urlopen(f"{API}/events?currentscreenonly=true", timeout=10).read()
+        raw = urllib.request.urlopen(f"{self.api}/events?currentscreenonly=true", timeout=10).read()
         return " / ".join(e["text"] for e in json.loads(raw)["events"])
 
     def choose(self, choice):
@@ -171,6 +184,8 @@ def check(name, ok, detail=""):
     print(("ok   " if ok else "FAIL ") + name + (f"  {detail}" if detail else ""), flush=True)
     if not ok:
         FAILED.append(name)
+        if os.environ.get("STOP_AT_FIRST_FAILURE"):
+            raise SystemExit(1)
 
 
 def test_enable(emu):
@@ -185,7 +200,8 @@ def test_enable(emu):
     check("an unknown network is shown in full", text.lower() == "0x" + root.hex(), text)
     check("the user can enable", sw == 0x9000)
     check("another network is refused", emu.send(ATTEST, vote(0, secrets.token_bytes(32), 0, 1))[1] == NOT_ENABLED)
-    check("an unknown key is refused", emu.send(ATTEST, struct.pack(">I", 32) + duty[4:])[1] == BAD_KEY)
+    check("an unknown key is refused", emu.send(ATTEST, struct.pack(">I", 36) + duty[4:])[1] == BAD_KEY)
+    check("an empty slot is refused", emu.send(ATTEST, struct.pack(">I", SLOT) + duty[4:])[1] == BAD_KEY)
     check("a short command is refused", emu.send(ATTEST, duty[:-1])[1] == BAD_LENGTH)
     check("signed without a press", emu.send(ATTEST, duty)[1] == 0x9000)
     check("the same target is refused", emu.send(ATTEST, duty)[1] == SLASHABLE)
@@ -562,6 +578,177 @@ def test_threshold(emu):
     check("one partial signature is not enough", not bls.Verify(group, message, partial[1]))
 
 
+def combine(partial, pair):
+    """The group's signature from two partial ones (Lagrange at zero)."""
+    total = None
+    for i in pair:
+        j = pair[0] if i == pair[1] else pair[1]
+        part = multiply(signature_to_G2(partial[i]), j * pow(j - i, -1, curve_order) % curve_order)
+        total = part if total is None else add(total, part)
+    return G2_to_signature(total)
+
+
+def test_keys(emu):
+    """Keys used in turn: each signature is made with the key asked for."""
+    assert emu.send(RESET)[1] == 0x9000
+    root = secrets.token_bytes(32)
+    assert emu.enable(root)[0] == 0x9000
+    wrong = []
+    for n, key in enumerate((0, 1, 31, 0, 31, 1, 17, 0)):
+        body = attestation(n, 0, secrets.token_bytes(32), n, bytes(32), n + 1, bytes(32))
+        sig, sw = emu.send(ATTEST, header(key, b"\0\0\0\1", root) + body)
+        message = sha(data_root(body), domain(b"\1\0\0\0", b"\0\0\0\1", root))
+        if sw != 0x9000 or not bls.Verify(emu.pubkey(key), message, sig):
+            wrong.append(key)
+    check("keys used in turn each sign with their own key", not wrong, str(wrong))
+    check("the keys are all different", len({emu.pubkey(k) for k in (0, 1, 17, 31)}) == 4)
+
+
+LABEL = b"ledger-validator-signer share import v1"
+
+
+def plain(text):
+    """A text of the screen without its spaces: a line may end where a space was."""
+    return text.replace(" ", "")
+
+
+def seal_share(device_pub, slot, index, group, share, source=0, target=0, block=0, flags=0):
+    """What is sent to a device to import one share: the header in clear, then the share sealed to
+    the device's key (ECDH on P-256, HKDF-SHA256, AES-256-GCM over the share, header authenticated)."""
+    head = bytes([slot, index]) + group + le(source) + le(target) + le(block) + bytes([flags])
+    sender = ec.generate_private_key(ec.SECP256R1())
+    sender_pub = sender.public_key().public_bytes(serialization.Encoding.X962,
+                                                  serialization.PublicFormat.UncompressedPoint)
+    shared = sender.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), device_pub))
+    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=LABEL + sender_pub + device_pub).derive(shared)
+    nonce = secrets.token_bytes(12)
+    raw = share if isinstance(share, bytes) else share.to_bytes(32, "big")
+    return head + sender_pub + nonce + AESGCM(key).encrypt(nonce, raw, head)
+
+
+def test_import():
+    """An existing key, split in three shares, each imported encrypted into a slot."""
+    emu = Emulator()
+    root = secrets.token_bytes(32)
+    assert emu.enable(root)[0] == 0x9000
+    check("import: refused before the device has shown its import key",
+          emu.send(IMPORT_SHARE, bytes(200))[1] == BAD_IMPORT)
+
+    emu.write(GET_IMPORT_KEY)
+    seen = emu.choose("Approve")
+    device_pub, sw = emu.answer()
+    text = shown(seen, "Key check")
+    check("import key: the screen shows its check",
+          sw == 0x9000 and len(device_pub) == 65 and text.lower() == hashlib.sha256(device_pub).hexdigest()[:16], text)
+    emu.write(GET_IMPORT_KEY)
+    emu.choose("Reject")
+    check("import key: the user can refuse to give it", emu.answer()[1] == DENIED)
+    emu.write(GET_IMPORT_KEY)
+    emu.choose("Approve")
+    check("import key: the same key every time", emu.answer()[0] == device_pub)
+
+    secret, slope = (secrets.randbelow(curve_order - 1) + 1 for _ in range(2))
+    shares = {i: (secret + slope * i) % curve_order for i in (1, 2, 3)}
+    group = G1_to_pubkey(multiply(G1, secret))
+    before = dict(source=5, target=6, block=100, flags=3)
+    good = seal_share(device_pub, 0, 1, group, shares[1], **before)
+
+    def flipped(blob, at):
+        return blob[:at] + bytes([blob[at] ^ 1]) + blob[at + 1:]
+
+    other_key = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    refused = {
+        "another slot than the one sealed": flipped(good, 0),
+        "another share number": flipped(good, 1),
+        "another group key": flipped(good, 20),
+        "an earlier starting point": flipped(good, 58),
+        "other flags": good[:74] + b"\1" + good[75:],
+        "a changed sender key": good[:75] + other_key + good[140:],
+        "a changed nonce": flipped(good, 141),
+        "a changed share": flipped(good, 160),
+        "a changed tag": flipped(good, 199),
+        "a share sealed to another device": seal_share(other_key, 0, 1, group, shares[1], **before),
+        "a share of zero": seal_share(device_pub, 0, 1, group, bytes(32), **before),
+        "a share above the order of the group": seal_share(device_pub, 0, 1, group, curve_order, **before),
+        "a slot that does not exist": seal_share(device_pub, 4, 1, group, shares[1], **before),
+        "a share number of zero": seal_share(device_pub, 0, 0, group, shares[1], **before),
+        "a starting point too large to show": seal_share(device_pub, 0, 1, group, shares[1], source=10 ** 12, flags=1),
+    }
+    for name, blob in refused.items():
+        check(f"import refused: {name}", emu.send(IMPORT_SHARE, blob)[1] == BAD_IMPORT)
+    check("import refused: a short message", emu.send(IMPORT_SHARE, good[:-1])[1] == BAD_LENGTH)
+    check("import: nothing was stored by the refused ones", emu.send(ATTEST, vote(SLOT, root, 10, 11))[1] == BAD_KEY)
+
+    emu.write(IMPORT_SHARE, good)
+    emu.choose("Reject")
+    check("import: the user can reject", emu.answer()[1] == DENIED)
+    check("import: nothing is stored after a reject", emu.send(ATTEST, vote(SLOT, root, 10, 11))[1] == BAD_KEY)
+
+    for slot, index in ((0, 1), (1, 2), (2, 3)):
+        emu.write(IMPORT_SHARE, seal_share(device_pub, slot, index, group, shares[index], **before))
+        seen = emu.choose("Approve")
+        sw = emu.answer()[1]
+        key_text = shown(seen, "Group key").lower()
+        ok = (sw == 0x9000 and plain(shown(seen, "Slot")) == f"{slot},share{index}"
+              and key_text == f"0x{group[:6].hex()}..{group[-6:].hex()}"
+              and plain(shown(seen, "Not before")) == "source5,target6,slot100")
+        check(f"import: share {index} into slot {slot}, shown on the screen", ok, str(seen[1:-1]))
+        check(f"import: slot {slot} gives the group key and its share number",
+              emu.send(PUBKEY, struct.pack(">I", SLOT + slot))[0] == group + bytes([index]))
+    check("import: the same share into another slot is refused",
+          emu.send(IMPORT_SHARE, seal_share(device_pub, 3, 1, group, shares[1]))[1] == BAD_IMPORT)
+
+    check("import: a vote at the starting point is refused", emu.send(ATTEST, vote(SLOT, root, 5, 6))[1] == SLASHABLE)
+    check("import: a vote from before the starting point is refused",
+          emu.send(ATTEST, vote(SLOT, root, 4, 7))[1] == SLASHABLE)
+    old_block = header(SLOT, b"\0\0\0\1", root) + le(100) + le(0) + secrets.token_bytes(96)
+    check("import: a block at the starting point is refused", emu.send(BLOCK, old_block)[1] == SLASHABLE)
+
+    body = attestation(64, 0, b"\2" * 32, 5, b"\3" * 32, 7, b"\4" * 32)
+    message = sha(data_root(body), domain(b"\1\0\0\0", b"\0\0\0\1", root))
+    partial = {}
+    for slot, index in ((0, 1), (1, 2), (2, 3)):
+        partial[index], sw = emu.send(ATTEST, header(SLOT + slot, b"\0\0\0\1", root) + body)
+        assert sw == 0x9000, hex(sw)
+    for pair in ((1, 2), (1, 3), (2, 3)):
+        check(f"import: slots of shares {pair} sign a vote for the group key",
+              bls.Verify(group, message, combine(partial, pair)))
+    check("import: one slot alone does not", not bls.Verify(group, message, partial[1]))
+    check("import: each slot has its own record",
+          emu.send(ATTEST, header(SLOT, b"\0\0\0\1", root) + body)[1] == SLASHABLE)
+
+    # Another duty, to see that a slot signs everything a key signs: the block header.
+    fields = [le(101), le(7), b"\5" * 32, b"\6" * 32, b"\7" * 32]
+    block_root = sha(merkle([pad(f) for f in fields], 8), domain(b"\0\0\0\0", b"\0\0\0\1", root))
+    for slot, index in ((0, 1), (2, 3)):
+        partial[index], sw = emu.send(BLOCK, header(SLOT + slot, b"\0\0\0\1", root) + b"".join(fields))
+        assert sw == 0x9000, hex(sw)
+    check("import: two slots sign a block for the group key", bls.Verify(group, block_root, combine(partial, (1, 3))))
+    epoch = le(9)
+    randao = sha(pad(epoch), domain(b"\2\0\0\0", b"\0\0\0\1", root))
+    for slot, index in ((1, 2), (2, 3)):
+        partial[index], sw = emu.send(RANDAO, header(SLOT + slot, b"\0\0\0\1", root) + epoch)
+        assert sw == 0x9000, hex(sw)
+    check("import: two slots sign a RANDAO reveal for the group key",
+          bls.Verify(group, randao, combine(partial, (2, 3))))
+
+    # The same share again, with an earlier starting point: the record does not go back.
+    emu.write(IMPORT_SHARE, seal_share(device_pub, 0, 1, group, shares[1], source=0, target=1, block=1, flags=3))
+    seen = emu.choose("Approve")
+    check("import again: accepted, and the screen keeps the later point",
+          emu.answer()[1] == 0x9000 and plain(shown(seen, "Not before")) == "source5,target7,slot101", str(seen[1:-1]))
+    check("import again: the record did not go back", emu.send(ATTEST, vote(SLOT, root, 5, 7))[1] == SLASHABLE)
+
+    emu.stop()
+    emu = Emulator(fresh=False)
+    check("import: the share is kept after a restart",
+          emu.send(PUBKEY, struct.pack(">I", SLOT + 1))[0] == group + bytes([2]))
+    check("import: its record too", emu.send(ATTEST, vote(SLOT + 1, root, 5, 7))[1] == SLASHABLE)
+    check("import: and it signs the next vote", emu.send(ATTEST, vote(SLOT + 1, root, 7, 8))[1] == 0x9000)
+    emu.stop()
+
+
 def test_restart():
     emu = Emulator()
     root = b"\x42" * 32
@@ -675,13 +862,132 @@ def test_daemon():
         emu.stop()
 
 
+def start_daemon(exe, arguments, url, log_name):
+    log = open(f"{WORK}/{log_name}", "w")
+    daemon = subprocess.Popen([exe] + arguments, stdout=log, stderr=log)
+    for _ in range(200):
+        time.sleep(0.25)
+        if daemon.poll() is not None:
+            raise SystemExit(f"a daemon stopped, see {WORK}/{log_name}")
+        try:
+            if http("GET", url + "/upcheck")[0] == 200:
+                return daemon
+        except OSError:
+            continue
+    daemon.kill()
+    raise SystemExit("a daemon did not start")
+
+
+def test_combiner():
+    """Three devices with one share each, a daemon in front of each, and one more daemon that
+    asks the three and gives the validator client the key's signature."""
+    exe = os.environ.get("DAEMON")
+    if not exe:
+        print("skip the combiner: DAEMON is not set")
+        return
+    doc = yaml.safe_load(open(f"{DATA}/remote-signing-api/signing/paths/sign.yaml"))
+    examples = {name: e["value"] for name, e in doc["post"]["requestBody"]["content"]["application/json"]["examples"].items()}
+    root = unhex(examples["ATTESTATION"]["fork_info"]["genesis_validators_root"])
+
+    def split():
+        secret, slope = (secrets.randbelow(curve_order - 1) + 1 for _ in range(2))
+        return G1_to_pubkey(multiply(G1, secret)), {i: (secret + slope * i) % curve_order for i in (1, 2, 3)}
+
+    group, shares = split()
+    # A second key, of which the first device is given a share that is not one.
+    spoiled, spoiled_shares = split()
+    spoiled_shares[1] = secrets.randbelow(curve_order - 1) + 1
+    key, spoiled_key = "0x" + group.hex(), "0x" + spoiled.hex()
+    emus, daemons = [], []
+    signers = [f"http://127.0.0.1:{9101 + n}" for n in range(3)]
+    front = "http://127.0.0.1:9100"
+
+    def signed(name, to=key, public=group):
+        status, body = http("POST", f"{front}/api/v1/eth2/sign/{to}", examples[name], "application/json")
+        ok = status == 200 and bls.Verify(public, unhex(examples[name]["signingRoot"]), unhex(json.loads(body)["signature"]))
+        return ok, f"{status} {body[:80]}"
+
+    try:
+        for n in range(3):
+            emu = Emulator(number=n)
+            emus.append(emu)
+            assert emu.enable(root)[0] == 0x9000
+            emu.write(GET_IMPORT_KEY)
+            emu.choose("Approve")
+            device_pub = emu.answer()[0]
+            for slot, (public, parts) in enumerate(((group, shares), (spoiled, spoiled_shares))):
+                emu.write(IMPORT_SHARE, seal_share(device_pub, slot, n + 1, public, parts[n + 1]))
+                emu.choose("Approve")
+                assert emu.answer()[1] == 0x9000
+            emu.sock.close()  # its daemon takes the device from here
+            daemons.append(start_daemon(exe, ["--device", f"127.0.0.1:{emu.apdu}", "--listen", f"127.0.0.1:{9101 + n}",
+                                              "--keys", "0"], signers[n], f"signer-{n}.log"))
+        daemons.append(start_daemon(exe, ["--combine", ",".join(signers), "--listen", "127.0.0.1:9100"], front, "combiner.log"))
+
+        check("combiner: a signer with shares offers no key of its own",
+              json.loads(http("GET", signers[0] + "/api/v1/eth2/publicKeys")[1]) == [])
+        held = json.loads(http("GET", signers[1] + "/api/v1/shares")[1])
+        check("combiner: a signer lists its shares", held == [{"pubkey": key, "share": 2}, {"pubkey": spoiled_key, "share": 2}], str(held))
+        offered = json.loads(http("GET", front + "/api/v1/eth2/publicKeys")[1])
+        check("combiner: offers the keys that enough signers hold", sorted(offered) == sorted([key, spoiled_key]), str(offered))
+        check("combiner: a signer alone gives a partial signature, not the key's",
+              not bls.Verify(group, unhex(examples["AGGREGATION_SLOT"]["signingRoot"]), unhex(json.loads(
+                  http("POST", f"{signers[0]}/partial/v1/eth2/sign/{key}", examples["AGGREGATION_SLOT"], "application/json")[1])["signature"])))
+
+        check("combiner: an attestation is signed for the key", *signed("ATTESTATION"))
+        status, body = http("POST", f"{front}/api/v1/eth2/sign/{key}", examples["ATTESTATION"])
+        check("combiner: the same attestation again is 412", status == 412, f"{status} {body[:60]}")
+        check("combiner: a RANDAO reveal is signed for the key", *signed("RANDAO_REVEAL"))
+        check("combiner: an unknown key is 404",
+              http("POST", f"{front}/api/v1/eth2/sign/0x{'ab' * 48}", examples["RANDAO_REVEAL"])[0] == 404)
+        check("combiner: a wrong share is left out, the two others sign", *signed("RANDAO_REVEAL", spoiled_key, spoiled))
+
+        # An exit waits for a press on each device.
+        answer = []
+        thread = threading.Thread(target=lambda: answer.append(signed("VOLUNTARY_EXIT")))
+        thread.start()
+        time.sleep(1.0)
+        for emu in emus:
+            emu.choose("Approve")
+        thread.join(200)
+        check("combiner: an exit is signed once approved on the devices", *(answer[0] if answer else (False, "no answer")))
+
+        daemons[2].terminate()
+        daemons[2].wait(20)
+        check("combiner: with one signer down, two still sign", *signed("SYNC_COMMITTEE_MESSAGE"))
+        daemons[1].terminate()
+        daemons[1].wait(20)
+        status, body = http("POST", f"{front}/api/v1/eth2/sign/{key}", examples["SYNC_COMMITTEE_SELECTION_PROOF"], "application/json")
+        check("combiner: with two signers down, nothing is signed", status == 500, f"{status} {body[:90]}")
+    finally:
+        for daemon in daemons:
+            if daemon.poll() is None:
+                daemon.terminate()
+                daemon.wait(20)
+        for emu in emus:
+            emu.stop()
+
+
 def test_release():
-    """A release build has none of the test commands."""
+    """A release build has none of the test commands, and it takes a share only the sealed way."""
     emu = Emulator()
     root = secrets.token_bytes(32)
     check("the app answers", emu.send(ATTEST, vote(0, root, 0, 1))[1] == NOT_ENABLED)
     for name, ins, data in (("import", IMPORT, bytes(62)), ("reset", RESET, b""), ("share", SHARE, bytes(200))):
         check(f"no {name} command", emu.send(ins, data)[1] == UNKNOWN_COMMAND)
+    emu.write(GET_IMPORT_KEY)
+    emu.choose("Approve")
+    device_pub, sw = emu.answer()
+    check("the key to seal a share to is given", sw == 0x9000 and len(device_pub) == 65)
+    secret = secrets.randbelow(curve_order - 1) + 1
+    group = G1_to_pubkey(multiply(G1, secret))
+    sealed = seal_share(device_pub, 0, 1, group, secret)
+    check("a sealed share that was changed is refused",
+          emu.send(IMPORT_SHARE, sealed[:160] + bytes([sealed[160] ^ 1]) + sealed[161:])[1] == BAD_IMPORT)
+    emu.write(IMPORT_SHARE, sealed)
+    emu.choose("Approve")
+    check("a sealed share is taken once approved", emu.answer()[1] == 0x9000
+          and emu.send(PUBKEY, struct.pack(">I", SLOT))[0] == group + b"\1")
     emu.stop()
 
 
@@ -698,10 +1004,13 @@ def main():
     test_registration(emu)
     test_eip3076(emu)
     test_threshold(emu)
+    test_keys(emu)
     emu.stop()
     test_restart()
+    test_import()
     test_before_approval()
     test_daemon()
+    test_combiner()
     print(f"\n{'FAILED: ' + ', '.join(FAILED) if FAILED else 'ALL PASSED'}")
     return bool(FAILED)
 
@@ -710,5 +1019,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     finally:
-        if Emulator.current:
-            Emulator.current.proc.kill()
+        for left in Emulator.running:
+            left.proc.kill()

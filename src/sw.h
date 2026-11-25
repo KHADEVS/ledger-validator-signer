@@ -16,3 +16,5 @@
 #define SW_BAD_DUTY 0xB105
 /* A registration for another fee recipient or gas limit than the ones approved on the device. */
 #define SW_SETTING 0xB106
+/* A key share that does not decrypt, or that the device cannot hold. */
+#define SW_BAD_IMPORT 0xB107

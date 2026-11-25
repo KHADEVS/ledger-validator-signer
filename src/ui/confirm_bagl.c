@@ -6,8 +6,8 @@
 #include "menu.h"
 
 char g_confirm_action[2][16];
-char g_confirm_title[2][12];
-char g_confirm_text[2][2 + 64 + 1];
+char g_confirm_title[3][12];
+char g_confirm_text[3][2 + 64 + 1];
 
 static void (*g_done)(bool approved);
 
@@ -27,6 +27,9 @@ UX_STEP_NOCB(ux_confirm_first_step,
 UX_STEP_NOCB(ux_confirm_second_step,
              bnnn_paging,
              {.title = g_confirm_title[1], .text = g_confirm_text[1]});
+UX_STEP_NOCB(ux_confirm_third_step,
+             bnnn_paging,
+             {.title = g_confirm_title[2], .text = g_confirm_text[2]});
 UX_STEP_CB(ux_confirm_approve_step, pb, choice(true), {&C_icon_validate_14, "Approve"});
 UX_STEP_CB(ux_confirm_reject_step, pb, choice(false), {&C_icon_crossmark, "Reject"});
 
@@ -43,9 +46,21 @@ UX_FLOW(ux_confirm_two_flow,
         &ux_confirm_approve_step,
         &ux_confirm_reject_step);
 
+UX_FLOW(ux_confirm_three_flow,
+        &ux_confirm_review_step,
+        &ux_confirm_first_step,
+        &ux_confirm_second_step,
+        &ux_confirm_third_step,
+        &ux_confirm_approve_step,
+        &ux_confirm_reject_step);
+
 void ui_confirm(uint8_t fields, void (*done)(bool approved)) {
     g_done = done;
-    ux_flow_init(0, fields == 2 ? ux_confirm_two_flow : ux_confirm_one_flow, NULL);
+    ux_flow_init(0,
+                 fields == 3   ? ux_confirm_three_flow
+                 : fields == 2 ? ux_confirm_two_flow
+                               : ux_confirm_one_flow,
+                 NULL);
 }
 
 #endif

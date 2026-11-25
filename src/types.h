@@ -19,6 +19,8 @@ typedef enum {
     SIGN_EXIT = 0x30,
     SET_FEE = 0x31,
     SIGN_REGISTRATION = 0x32,
+    GET_IMPORT_KEY = 0x33,
+    IMPORT_SHARE = 0x34,
 #ifdef TEST_BUILD
     TEST_IMPORT_MARK = 0x24,
     TEST_RESET = 0x25,

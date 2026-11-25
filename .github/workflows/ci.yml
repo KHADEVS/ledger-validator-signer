@@ -17,7 +17,9 @@ jobs:
       - name: Format and lints
         run: |
           cargo fmt --manifest-path daemon/Cargo.toml --check
-          cargo clippy --manifest-path daemon/Cargo.toml --locked -- -D warnings
+          cargo clippy --manifest-path daemon/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Tests of the combiner
+        run: cargo test --manifest-path daemon/Cargo.toml --locked
       # A static binary, so that it runs in the emulator's container whatever its C library.
       - name: Build
         run: |
@@ -31,7 +33,7 @@ jobs:
   test:
     needs: daemon
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     container: ghcr.io/ledgerhq/ledger-app-builder/ledger-app-dev-tools:latest
     steps:
       - uses: actions/checkout@v4

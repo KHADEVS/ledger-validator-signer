@@ -36,7 +36,7 @@ int apdu_dispatcher(const command_t *cmd) {
             return handler_get_app_name();
 
         case GET_SIGNING_PK:
-            return size_is(cmd, 4) ? handler_get_signing_pk(U4BE(cmd->data, 0))
+            return size_is(cmd, 4) ? handler_get_pk(U4BE(cmd->data, 0))
                                    : io_send_sw(SW_WRONG_DATA_LENGTH);
 
         case ENABLE:
@@ -88,6 +88,13 @@ int apdu_dispatcher(const command_t *cmd) {
         case SIGN_REGISTRATION:
             return size_is(cmd, DUTY_HEADER + 36) ? handler_sign_registration(cmd->data)
                                                   : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case GET_IMPORT_KEY:
+            return size_is(cmd, 0) ? handler_get_import_key() : io_send_sw(SW_WRONG_DATA_LENGTH);
+
+        case IMPORT_SHARE:
+            return size_is(cmd, IMPORT_SIZE) ? handler_import_share(cmd->data)
+                                             : io_send_sw(SW_WRONG_DATA_LENGTH);
 
 #ifdef TEST_BUILD
         case TEST_IMPORT_MARK:

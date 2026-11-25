@@ -27,6 +27,14 @@ int handler_sign_exit(const uint8_t *data);
 int handler_set_fee(const uint8_t *data);
 int handler_sign_registration(const uint8_t *data);
 
+/* slot 1 | share 1 | group key 48 | source 8 | target 8 | block slot 8 | flags 1 | sender key 65 | nonce 12 | share 32 | tag 16 */
+#define IMPORT_HEADER 75
+#define IMPORT_SIZE   (IMPORT_HEADER + 65 + 12 + 32 + 16)
+
+int handler_get_pk(uint32_t key);
+int handler_get_import_key(void);
+int handler_import_share(const uint8_t *data);
+
 #ifdef TEST_BUILD
 int handler_import_mark(const uint8_t *data);
 int handler_reset(void);
